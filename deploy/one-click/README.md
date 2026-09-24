@@ -399,8 +399,8 @@ When `CUBE_EXTERNAL_MYSQL_HOST`, `CUBE_EXTERNAL_POSTGRES_HOST` (with
 `CUBE_DATABASE_DRIVER=postgres`), and/or `CUBE_EXTERNAL_REDIS_HOST` is set,
 `install.sh`:
 
-- patches `CubeMaster/conf.yaml` with the external endpoint and sets
-  `instance_db_config.driver` for SQL engines;
+- patches `instance_db_config` (`driver`, address, user, password, database) in
+  both `CubeMaster/conf.yaml` and `CubeTemplateCenter/conf.yaml`;
 - writes `DATABASE_URL` (`mysql://` or `postgresql://`) and `CUBE_PROXY_REDIS_*`
   to `.one-click.env` so every service consumes the external endpoint;
 - masks the corresponding `cube-sandbox-mysql.service` / `cube-sandbox-redis.service`
@@ -411,8 +411,8 @@ When `CUBE_EXTERNAL_MYSQL_HOST`, `CUBE_EXTERNAL_POSTGRES_HOST` (with
   local containers were never started for the external dependency.)
 
 The external database must already grant the configured user access to the
-target database. CubeMaster runs its own embedded schema migrations on first
-start.
+target database. CubeMaster and CubeTemplateCenter both open that database and
+run embedded schema migrations on first start.
 
 ### Bundled MinIO vs the S3 volume plugin
 
@@ -771,7 +771,7 @@ export TENCENTCLOUD_TKE_NODE_COUNT=2              # TKE worker nodes (default 2)
 export TENCENTCLOUD_COMPUTE_INSTANCE_TYPE=SA9.MEDIUM8
 export TENCENTCLOUD_USE_TCR=false                 # default: public pre-built images
 export TENCENTCLOUD_USE_CFS=false                 # default: no CFS, cubemaster single replica
-export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.7.2-rc2
+export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.7.2-rc3
 ```
 
 For non-interactive / CI runs, also set these (without a TTY the interactive

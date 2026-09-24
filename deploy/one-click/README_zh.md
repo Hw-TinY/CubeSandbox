@@ -326,12 +326,12 @@ CUBE_EXTERNAL_REDIS_PASSWORD=ceuhvu123
 当设置了 `CUBE_EXTERNAL_MYSQL_HOST`、`CUBE_EXTERNAL_POSTGRES_HOST`（且
 `CUBE_DATABASE_DRIVER=postgres`）和/或 `CUBE_EXTERNAL_REDIS_HOST` 时，`install.sh` 会：
 
-- 用外部地址改写 `CubeMaster/conf.yaml`，并设置 `instance_db_config.driver`；
+- 用外部地址改写 `CubeMaster/conf.yaml` 和 `CubeTemplateCenter/conf.yaml` 的 `instance_db_config`（驱动、地址、用户、密码、库名）；
 - 将 `DATABASE_URL`（`mysql://` 或 `postgresql://`）和 `CUBE_PROXY_REDIS_*` 写入 `.one-click.env`，让各服务都连接外部地址；
 - mask 对应的 `cube-sandbox-mysql.service` / `cube-sandbox-redis.service`，本地容器不会再被启动；
 - 让 `quickcheck.sh` 和 `up-support.sh` 跳过对已外置依赖的本地生命周期管理（`down-support.sh` 未感知外部依赖，仍会执行 `docker compose down`，但由于本地容器从未被启动，这是无害的空操作）。
 
-外部数据库需要预先授予所配置用户对目标库的访问权限；CubeMaster 首次启动会自行执行内置 schema 迁移。
+外部数据库需要预先授予所配置用户对目标库的访问权限。CubeMaster 和 CubeTemplateCenter 都会打开这个库，并在首次启动时执行内置 schema 迁移。
 
 ### 内置 MinIO 与 S3 Volume 插件
 
@@ -643,7 +643,7 @@ export TENCENTCLOUD_TKE_NODE_COUNT=2              # TKE worker 节点数（默�
 export TENCENTCLOUD_COMPUTE_INSTANCE_TYPE=SA9.MEDIUM8
 export TENCENTCLOUD_USE_TCR=false                 # 默认使用公网预置镜像
 export TENCENTCLOUD_USE_CFS=false                 # 默认无 CFS，cubemaster 单副本
-export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.7.2-rc2
+export TENCENTCLOUD_CUBE_IMAGE_TAG=v0.7.2-rc3
 ```
 
 非交互 / CI 运行时建议显式设置以下变量（没有 TTY 时交互菜单会回退到默认值，显式设置可避免意外）。密码变量是例外：非交互运行会拒绝使用仓库中公开可见的内置演示密码并要求显式设置；如需在临时沙箱中使用不安全的默认密码，可设置 `TENCENTCLOUD_ALLOW_INSECURE_DEFAULTS=1`。
