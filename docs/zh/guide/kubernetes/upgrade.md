@@ -70,10 +70,10 @@ cubeNode:
 ```yaml
 images:
   cubelet:
-    tag: v0.7.2-rc3
+    tag: v0.7.3
   # 需要一起升再写上，例如：
   # cubeShim:
-  #   tag: v0.7.2-rc3
+  #   tag: v0.7.3
 ```
 
 只改你真正要升的键；其它镜像保持不动即可。完整键名见文末[附录](#附录-镜像键速查)。
@@ -141,7 +141,7 @@ kubectl rollout status deploy/cube-master -n cube-system
 | 手动删 Big Pod | 等于重建数据面 |
 | 把产物安装塞进 Big Pod | 破坏分工；产物应走 Installer |
 
-另外：`cubeNode.env`、`cubeNode.podAnnotations`、网络相关 env、`global.timezone`、`cubeEgress.enabled` 也会改 Pod template——**不是日常无感升级项**。
+另外：`cubeNode.env`、`cubeNode.podAnnotations`、网络相关 env、`global.timezone` 也会改 Pod template——**不是日常无感升级项**。
 
 ---
 

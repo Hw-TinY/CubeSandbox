@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Tencent. All rights reserved.
 
-import { api, ops, setTokens, clearTokens } from '@/lib/api';
+import { api, apiWithHeaders, ops, setTokens, clearTokens } from '@/lib/api';
 import type { components } from './generated/schema';
 
 export type ClusterOverviewDto = components['schemas']['ClusterOverview'];
@@ -23,6 +23,8 @@ export interface SandboxDetail extends SandboxDetailDto {}
 
 export interface TemplateSummary {
   templateID: string;
+  /** Maps from dto.aliases[0] (CubeAPI) or dto.displayName (CubeOps, camelCased CubeMaster `display_name`). */
+  displayName?: string | null;
   instanceType?: string | null;
   version?: string | null;
   status: string;
@@ -39,8 +41,6 @@ export interface TemplateDetail extends TemplateSummary {
   createRequest?: unknown;
   networkType?: string | null;
   allowInternetAccess?: boolean | null;
-  /** Maps from dto.aliases[0] — CubeMaster returns the template alias as `aliases: string[]`. */
-  displayName?: string | null;
 }
 
 export interface TemplateCompatSummary {
@@ -133,6 +133,10 @@ function mapSandboxDetail(dto: SandboxDetailDto): SandboxDetail {
 function mapTemplateSummary(dto: TemplateSummaryDto): TemplateSummary {
   return {
     templateID: dto.templateID,
+    displayName:
+      dto.aliases?.[0]?.trim() ||
+      (dto as unknown as { displayName?: string }).displayName?.trim() ||
+      null,
     instanceType: dto.instanceType,
     version: dto.version,
     status: dto.status,
@@ -210,12 +214,29 @@ const DEFAULT_RESUME_BODY: SandboxResumeRequest = {
 };
 
 export const sandboxApi = {
-  list: (params?: {
+  list: async (params?: {
     metadata?: string;
     state?: RunningSandbox['state'];
     nextToken?: string;
     limit?: number;
-  }) => api<ListedSandboxDto[]>('/v2/sandboxes', { params }).then((items) => items.map(mapSandbox)),
+  }) => {
+    // `GET /v2/sandboxes` paginates through the `x-next-token` response
+    // header rather than the body. Follow the cursor until the backend stops
+    // advertising another page so callers that want the full list (the
+    // dashboard does) are not silently truncated to the first page.
+    const items: ListedSandboxDto[] = [];
+    let nextToken = params?.nextToken;
+    for (;;) {
+      const { data, headers } = await apiWithHeaders<ListedSandboxDto[]>('/v2/sandboxes', {
+        params: { ...params, nextToken },
+      });
+      items.push(...data);
+      const token = headers.get('x-next-token');
+      if (!token) break;
+      nextToken = token;
+    }
+    return items.map(mapSandbox);
+  },
   get: (id: string) => api<SandboxDetailDto>(`/sandboxes/${id}`).then(mapSandboxDetail),
   kill: (id: string) => api<void>(`/sandboxes/${id}`, { method: 'DELETE' }),
   pause: (id: string) => api<void>(`/sandboxes/${id}/pause`, { method: 'POST' }),

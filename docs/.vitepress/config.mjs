@@ -152,10 +152,10 @@ export default withMermaid(defineConfig({
           { text: 'Home', link: '/' },
           { text: 'Guide', link: '/guide/introduction' },
           { text: 'Architecture', link: '/architecture/overview' },
-          { text: 'Developer', link: '/dev/' },
           {
             text: 'Community',
             items: [
+              { text: 'Developer', link: '/dev/' },
               { text: 'Roadmap', link: '/guide/roadmap' },
               { text: 'Cube 100 Program', link: '/guide/cube100' },
               { text: 'Contributing', link: 'https://github.com/tencentcloud/CubeSandbox/blob/master/CONTRIBUTING.md' }
@@ -163,6 +163,7 @@ export default withMermaid(defineConfig({
           },
           { text: 'Blog', link: '/blog/' },
           { text: 'Changelog', link: '/changelog/' },
+          { text: 'QualityStatus', link: '/guide/quality-status' },
           { text: 'Contributors', link: '/contributors' },
           { text: 'About us', link: '/about-us' }
         ],
@@ -204,7 +205,6 @@ export default withMermaid(defineConfig({
               text: 'Core Concepts',
               items: [
                 { text: 'Sandbox Lifecycle', link: '/guide/lifecycle' },
-                { text: 'Agent Platform Freeze / Resume', link: '/guide/agent-platform-freeze' },
                 { text: 'Templates Overview', link: '/guide/templates' },
                 { text: 'Snapshot, Rollback & Clone', link: '/guide/snapshot-rollback-clone' },
                 { text: 'Cross-Node Snapshots', link: '/guide/cross-node-snapshot' }
@@ -234,7 +234,8 @@ export default withMermaid(defineConfig({
                 { text: 'Pre-warm a Template Service', link: '/guide/tutorials/prewarm-template-service' },
                 { text: 'Local & Remote Image Practice', link: '/guide/tutorials/template-build-practice' },
                 { text: 'Template Inspection & Request Preview', link: '/guide/template-inspection-and-preview' },
-                { text: 'Template Aliases', link: '/guide/template-aliases' }
+                { text: 'Template Aliases', link: '/guide/template-aliases' },
+                { text: 'MCP in Sandboxes', link: '/guide/mcp-gateway' }
               ]
             },
             {
@@ -280,7 +281,7 @@ export default withMermaid(defineConfig({
                 { text: 'Sandbox Resource Metrics', link: '/guide/resource-metrics' },
                 { text: 'Sandbox Logs', link: '/guide/sandbox-logs' },
                 { text: 'Performance Benchmark', link: '/guide/performance-benchmark' },
-                { text: 'Quality Status', link: '/guide/quality-status' }
+                { text: 'QualityStatus', link: '/guide/quality-status' }
               ]
             },
             {
@@ -325,7 +326,9 @@ export default withMermaid(defineConfig({
                     { text: 'unisound', link: '/guide/usecases/unisound-rl-rollout' },
                     { text: 'WeKnora', link: '/guide/usecases/weknora' },
                     { text: 'Huajiao', link: '/guide/usecases/huajiao' },
-                    { text: 'OpenFuyao', link: '/guide/usecases/openfuyao' }
+                    { text: 'OpenFuyao', link: '/guide/usecases/openfuyao' },
+                    { text: 'Galxe Alva', link: '/guide/usecases/galxe-alva' },
+                    { text: 'LambChat', link: '/guide/usecases/lambchat' }
                   ]
                 }
               ]
@@ -369,10 +372,10 @@ export default withMermaid(defineConfig({
           { text: '首页', link: '/zh/' },
           { text: '指南', link: '/zh/guide/introduction' },
           { text: '架构', link: '/zh/architecture/overview' },
-          { text: '开发者', link: '/zh/dev/' },
           {
             text: '社区',
             items: [
+              { text: '开发者', link: '/zh/dev/' },
               { text: '路线图', link: '/zh/guide/roadmap' },
               { text: 'Cube 100 计划', link: '/zh/guide/cube100' },
               { text: '参与贡献', link: 'https://github.com/tencentcloud/CubeSandbox/blob/master/CONTRIBUTING_zh.md' }
@@ -380,6 +383,7 @@ export default withMermaid(defineConfig({
           },
           { text: '博客', link: '/zh/blog/' },
           { text: '更新日志', link: '/zh/changelog/' },
+          { text: '质量状态', link: '/zh/guide/quality-status' },
           { text: '贡献者', link: '/zh/contributors' },
           { text: '关于我们', link: '/zh/about-us' }
         ],
@@ -421,7 +425,6 @@ export default withMermaid(defineConfig({
               text: '核心概念',
               items: [
                 { text: '沙箱生命周期', link: '/zh/guide/lifecycle' },
-                { text: 'Agent 平台 Freeze / Resume', link: '/zh/guide/agent-platform-freeze' },
                 { text: '模板概览', link: '/zh/guide/templates' },
                 { text: '快照、回滚与克隆', link: '/zh/guide/snapshot-rollback-clone' },
                 { text: '跨机快照', link: '/zh/guide/cross-node-snapshot' }
@@ -451,7 +454,8 @@ export default withMermaid(defineConfig({
                 { text: '预热模板服务', link: '/zh/guide/tutorials/prewarm-template-service' },
                 { text: '本地与远程镜像实战', link: '/zh/guide/tutorials/template-build-practice' },
                 { text: '模板检查与请求预览', link: '/zh/guide/template-inspection-and-preview' },
-                { text: '模板别名', link: '/zh/guide/template-aliases' }
+                { text: '模板别名', link: '/zh/guide/template-aliases' },
+                { text: '在沙箱中使用 MCP', link: '/zh/guide/mcp-gateway' }
               ]
             },
             {
@@ -542,7 +546,9 @@ export default withMermaid(defineConfig({
                     { text: 'unisound', link: '/zh/guide/usecases/unisound-rl-rollout' },
                     { text: 'WeKnora', link: '/zh/guide/usecases/weknora' },
                     { text: 'Huajiao', link: '/zh/guide/usecases/huajiao' },
-                    { text: 'OpenFuyao', link: '/zh/guide/usecases/openfuyao' }
+                    { text: 'OpenFuyao', link: '/zh/guide/usecases/openfuyao' },
+                    { text: 'Galxe Alva', link: '/zh/guide/usecases/galxe-alva' },
+                    { text: 'LambChat', link: '/zh/guide/usecases/lambchat' }
                   ]
                 }
               ]

@@ -35,6 +35,9 @@ const PAUSE_RESUME_ROUTE_TIMEOUT: Duration = Duration::from_secs(120);
 /// delete (`DELETE /templates/:id`).
 const SNAPSHOT_LONG_ROUTE_TIMEOUT: Duration = Duration::from_secs(240);
 
+/// Fork = snapshot + derive fan-out on CubeMaster.
+const FORK_ROUTE_TIMEOUT: Duration = Duration::from_secs(1560);
+
 pub fn build_router(state: AppState) -> Router {
     let auth_configured = state
         .config
@@ -59,11 +62,16 @@ pub fn build_router(state: AppState) -> Router {
         Router::new().merge(build_e2b_snapshot_long_router(&state, auth_configured)),
         SNAPSHOT_LONG_ROUTE_TIMEOUT,
     );
+    let fork_router = apply_http_layers(
+        Router::new().merge(build_fork_routes(&state, auth_configured)),
+        FORK_ROUTE_TIMEOUT,
+    );
 
     Router::new()
         .merge(standard_router)
         .merge(pause_resume_router)
         .merge(snapshot_long_router)
+        .merge(fork_router)
         .with_state(state)
 }
 
@@ -88,6 +96,7 @@ fn build_sandbox_routes(state: &AppState, auth_configured: bool) -> Router<AppSt
         .route("/sandboxes", get(sandboxes::list_sandboxes))
         .route("/sandboxes", post(sandboxes::create_sandbox))
         .route("/v2/sandboxes", get(sandboxes::list_sandboxes_v2))
+        .route("/v2/sandboxes", post(sandboxes::create_sandbox_v2))
         .route("/sandboxes/:sandboxID", get(sandboxes::get_sandbox))
         .route("/sandboxes/:sandboxID", delete(sandboxes::kill_sandbox))
         .route(
@@ -130,6 +139,10 @@ fn build_e2b_pause_resume_router(state: &AppState, auth_configured: bool) -> Rou
         .route(
             "/sandboxes/:sandboxID/connect",
             post(sandboxes::connect_sandbox),
+        )
+        .route(
+            "/v2/sandboxes/:sandboxID/connect",
+            post(sandboxes::connect_sandbox_v2),
         );
 
     with_auth_and_rate_limit(routes, state, auth_configured)
@@ -146,6 +159,14 @@ fn build_long_sandbox_routes(state: &AppState, auth_configured: bool) -> Router<
             "/sandboxes/:sandboxID/rollback",
             post(snapshots::rollback_sandbox),
         );
+
+    with_auth_and_rate_limit(routes, state, auth_configured)
+}
+
+/// Fork runs on its own budget: the snapshot step alone may take the full
+/// 15-minute snapshot budget, before any derivation starts.
+fn build_fork_routes(state: &AppState, auth_configured: bool) -> Router<AppState> {
+    let routes = Router::new().route("/sandboxes/:sandboxID/fork", post(sandboxes::fork_sandbox));
 
     with_auth_and_rate_limit(routes, state, auth_configured)
 }
@@ -255,7 +276,7 @@ mod tests {
     use axum::{
         extract::Json,
         http::{header::RETRY_AFTER, StatusCode},
-        routing::delete,
+        routing::{delete, post},
         Router,
     };
     use axum_test::TestServer;
@@ -344,6 +365,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_create_forwards_flattened_body_without_v2_flags() {
+        use axum::{extract::State, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture {
+            body: Arc<Mutex<Option<Value>>>,
+        }
+
+        async fn create_handler(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *capture.body.lock().unwrap() = Some(body);
+            Json(serde_json::json!({
+                "requestID": "req-1",
+                "sandbox_id": "sb-123",
+                "ret": { "ret_code": 0, "ret_msg": "ok" }
+            }))
+        }
+
+        let capture = Capture::default();
+        let server_capture = capture.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock CubeMaster listener should bind");
+        let address = listener.local_addr().expect("mock CubeMaster address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/cube/sandbox", post(create_handler))
+                    .with_state(server_capture),
+            )
+            .await
+            .expect("mock CubeMaster server should run");
+        });
+
+        let mut config = ServerConfig::default();
+        config.cubemaster_url = format!("http://{address}");
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        let server = TestServer::new(build_router(state)).expect("router should build");
+
+        let resp = server
+            .post("/v2/sandboxes")
+            .json(&serde_json::json!({
+                "templateID": "tpl-1",
+                "timeout": 120,
+                "autoPauseMemory": true
+            }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::CREATED);
+
+        let body = capture.body.lock().unwrap().clone().expect("create body");
+        // The v1 body reaches CubeMaster with the template id intact.
+        assert_eq!(
+            body["annotations"]["cube.master.appsnapshot.template.id"],
+            "tpl-1"
+        );
+        // v2-only autoPauseMemory must not leak through to CubeMaster.
+        assert!(body.get("autoPauseMemory").is_none());
+    }
+
+    #[tokio::test]
     async fn preserves_root_e2b_routes() {
         let server = test_server().await;
 
@@ -359,10 +444,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_sandbox_create_and_connect_routes_are_mounted() {
+        let server = test_server().await;
+
+        // POST /v2/sandboxes is mounted: with an unreachable CubeMaster it must
+        // fail with a 5xx, never 404/405 (which would mean the route is missing).
+        let resp = server
+            .post("/v2/sandboxes")
+            .json(&serde_json::json!({ "templateID": "tpl-1" }))
+            .await;
+        assert_ne!(resp.status_code(), StatusCode::NOT_FOUND);
+        assert_ne!(resp.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // POST /v2/sandboxes/{id}/connect is mounted (empty body is valid).
+        let resp = server
+            .post("/v2/sandboxes/sb-1/connect")
+            .json(&serde_json::json!({}))
+            .await;
+        assert_ne!(resp.status_code(), StatusCode::NOT_FOUND);
+        assert_ne!(resp.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn v2_create_rejects_unsupported_auto_pause_memory_false() {
+        let server = test_server().await;
+
+        let resp = server
+            .post("/v2/sandboxes")
+            .json(&serde_json::json!({
+                "templateID": "tpl-1",
+                "autoPauseMemory": false
+            }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn v2_connect_rejects_unsupported_memory_false() {
+        let server = test_server().await;
+
+        let resp = server
+            .post("/v2/sandboxes/sb-1/connect")
+            .json(&serde_json::json!({ "memory": false }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn resume_and_connect_reject_invalid_timeout_before_cubemaster() {
         let server = test_server().await;
 
-        for path in ["/sandboxes/sb-1/resume", "/sandboxes/sb-1/connect"] {
+        for path in [
+            "/sandboxes/sb-1/resume",
+            "/sandboxes/sb-1/connect",
+            "/v2/sandboxes/sb-1/connect",
+        ] {
             let response = server
                 .post(path)
                 .json(&serde_json::json!({ "timeout": -2 }))
@@ -374,11 +510,17 @@ mod tests {
             );
         }
 
-        let response = server
-            .post("/sandboxes/sb-1/connect")
-            .json(&serde_json::json!({ "timeout": 0 }))
-            .await;
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        for path in ["/sandboxes/sb-1/connect", "/v2/sandboxes/sb-1/connect"] {
+            let response = server
+                .post(path)
+                .json(&serde_json::json!({ "timeout": 0 }))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "path={path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -579,5 +721,253 @@ mod tests {
             resp.status_code(),
             resp.text(),
         );
+    }
+
+    /// `GET /snapshots` documents `limit` as "default 100, max 100". CubeAPI
+    /// used to forward the value to CubeMaster untouched, so CubeAPI's own
+    /// documented default was never applied — callers omitting `limit` got
+    /// CubeMaster's default of 20 instead of the advertised 100.
+    ///
+    /// This exercises the whole handler → service → CubeMaster path and
+    /// asserts the value that actually leaves the process, so removing the
+    /// normalisation at any layer turns this red.
+    #[tokio::test]
+    async fn list_snapshots_clamps_limit_before_reaching_cubemaster() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::{extract::Query, routing::get, Json, Router};
+        use serde_json::Value;
+
+        // CubeMaster receives `limit` as a query parameter (see
+        // `cubemaster::CubeMasterClient::list_snapshots`), so recording the
+        // observed query string is enough to pin the value end to end.
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_handler = Arc::clone(&seen);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock CubeMaster listener should bind");
+        let address = listener.local_addr().expect("mock CubeMaster address");
+        tokio::spawn(async move {
+            let router = Router::new().route(
+                "/cube/snapshot",
+                get(move |Query(params): Query<Value>| {
+                    let seen = Arc::clone(&seen_for_handler);
+                    async move {
+                        seen.lock().unwrap().push(
+                            params
+                                .get("limit")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                        );
+                        Json(serde_json::json!({
+                            "requestID": "list-snapshots-request",
+                            "ret": { "ret_code": 0, "ret_msg": "ok" },
+                            "data": [],
+                            "next_token": "",
+                        }))
+                    }
+                }),
+            );
+            axum::serve(listener, router)
+                .await
+                .expect("mock CubeMaster server should run");
+        });
+
+        let config = ServerConfig {
+            cubemaster_url: format!("http://{address}"),
+            ..Default::default()
+        };
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        let server = TestServer::new(build_router(state)).expect("router should build");
+
+        for (query, expected) in [
+            // Omitted → documented default.
+            (None, "100"),
+            // Oversized → capped at the documented maximum.
+            (Some("100000"), "100"),
+            (Some("101"), "100"),
+            // Non-positive → falls back to the default rather than asking
+            // CubeMaster for no page at all.
+            (Some("0"), "100"),
+            (Some("-5"), "100"),
+            // In-range values pass through untouched.
+            (Some("1"), "1"),
+            (Some("100"), "100"),
+        ] {
+            // `axum_test`'s `get()` treats a `?`-bearing string as a path, so
+            // the parameter is attached through `add_query_param` instead.
+            let mut request = server.get("/snapshots");
+            if let Some(limit) = query {
+                request = request.add_query_param("limit", limit);
+            }
+            let resp = request.await;
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::OK,
+                "GET /snapshots?limit={query:?} should succeed (got {} body={:?})",
+                resp.status_code(),
+                resp.text(),
+            );
+            let observed = seen.lock().unwrap().last().cloned().flatten();
+            assert_eq!(
+                observed.as_deref(),
+                Some(expected),
+                "GET /snapshots?limit={query:?} must send limit={expected} to \
+                 CubeMaster, got {observed:?} — the documented \"default 100, \
+                 max 100\" contract is not being applied"
+            );
+        }
+    }
+
+    /// `GET /v2/sandboxes` declared a `nextToken` query parameter and then
+    /// ignored it: the handler never read it and the service always asked
+    /// CubeMaster from the first entry, so every page returned the same first
+    /// `limit` sandboxes and a client could never reach past it.
+    ///
+    /// Driven through the real router so the assertions cover what a client
+    /// actually observes — the `x-next-token` header and the cursor being
+    /// accepted on the next request.
+    #[tokio::test]
+    async fn list_sandboxes_v2_returns_a_usable_next_token_header() {
+        async fn list_handler(Json(_request): Json<Value>) -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-list",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "size": 1,
+                "data": [
+                    { "sandbox_id": "sb-1", "host_id": "h", "status": 1, "template_id": "t" },
+                    { "sandbox_id": "sb-2", "host_id": "h", "status": 1, "template_id": "t" },
+                    { "sandbox_id": "sb-3", "host_id": "h", "status": 1, "template_id": "t" }
+                ]
+            }))
+        }
+
+        let server = sandbox_list_server(list_handler).await;
+
+        let first = server
+            .get("/v2/sandboxes")
+            .add_query_param("limit", "2")
+            .await;
+        assert_eq!(first.status_code(), StatusCode::OK);
+        let cursor = first
+            .headers()
+            .get("x-next-token")
+            .expect("a third sandbox remains, so the cursor header must be present")
+            .to_str()
+            .expect("the cursor should be valid ASCII")
+            .to_string();
+        assert!(!cursor.is_empty(), "the cursor must carry a value");
+
+        let first_page: Vec<Value> = first.json();
+        assert_eq!(first_page.len(), 2, "limit caps the page");
+
+        let second = server
+            .get("/v2/sandboxes")
+            .add_query_param("limit", "2")
+            .add_query_param("nextToken", cursor.clone())
+            .await;
+        assert_eq!(second.status_code(), StatusCode::OK);
+        let trailing_cursor = second
+            .headers()
+            .get("x-next-token")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            trailing_cursor.is_empty(),
+            "the last page must not advertise another one, got {trailing_cursor:?}"
+        );
+
+        let second_page: Vec<Value> = second.json();
+        assert_eq!(second_page.len(), 1, "only one sandbox is left");
+        assert_eq!(
+            second_page[0]["sandboxID"], "sb-3",
+            "the cursor must continue past the first page"
+        );
+    }
+
+    /// A cursor the client could not have obtained from us is a client mistake,
+    /// not a reason to silently restart from the first page — which is exactly
+    /// the behaviour being replaced.
+    #[tokio::test]
+    async fn list_sandboxes_v2_rejects_an_unknown_next_token() {
+        async fn list_handler(Json(_request): Json<Value>) -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-list",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "size": 1,
+                "data": [{ "sandbox_id": "sb-1", "host_id": "h", "status": 1, "template_id": "t" }]
+            }))
+        }
+
+        let server = sandbox_list_server(list_handler).await;
+        let response = server
+            .get("/v2/sandboxes")
+            .add_query_param("limit", "2")
+            .add_query_param("nextToken", "garbage")
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let error: crate::models::ApiError = response.json();
+        assert_eq!(error.code, 400);
+    }
+
+    /// `limit` used to fall through `.max(1)`, so `limit=0`/`-1` silently
+    /// returned one item per page — and because every page costs a full
+    /// node-window walk, a client paging one item at a time forced one cluster
+    /// sweep *per sandbox*. It is rejected instead.
+    #[tokio::test]
+    async fn list_sandboxes_v2_rejects_an_out_of_range_limit() {
+        async fn list_handler(Json(_request): Json<Value>) -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-list",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "size": 1,
+                "data": [{ "sandbox_id": "sb-1", "host_id": "h", "status": 1, "template_id": "t" }]
+            }))
+        }
+
+        let server = sandbox_list_server(list_handler).await;
+        for limit in ["0", "-1", "1001"] {
+            let response = server
+                .get("/v2/sandboxes")
+                .add_query_param("limit", limit)
+                .await;
+
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "limit={limit} must be rejected rather than silently clamped"
+            );
+            let error: crate::models::ApiError = response.json();
+            assert_eq!(error.code, 400);
+        }
+    }
+
+    async fn sandbox_list_server<F, Fut>(list_handler: F) -> TestServer
+    where
+        F: Fn(Json<Value>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Json<Value>> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock CubeMaster listener should bind");
+        let address = listener.local_addr().expect("mock CubeMaster address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/cube/sandbox/list", post(list_handler)),
+            )
+            .await
+            .expect("mock CubeMaster server should run");
+        });
+
+        let config = ServerConfig {
+            cubemaster_url: format!("http://{address}"),
+            ..Default::default()
+        };
+        let state = AppState::new(config, arc(NoopLogger)).await;
+        TestServer::new(build_router(state)).expect("router should build")
     }
 }

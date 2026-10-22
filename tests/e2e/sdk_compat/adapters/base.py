@@ -47,6 +47,15 @@ class SandboxAdapter(ABC):
     def read_file(self, path: str, *, user: str = "root") -> str:
         raise NotImplementedError
 
+    def write_bytes(self, path: str, content: bytes, *, user: str = "root") -> None:
+        raise UnsupportedCapability(self.backend, "filesystem")
+
+    def read_bytes(self, path: str, *, user: str = "root") -> bytes:
+        raise UnsupportedCapability(self.backend, "filesystem")
+
+    def read_stream(self, path: str, *, user: str = "root") -> bytes:
+        raise UnsupportedCapability(self.backend, "filesystem")
+
     def list_files(self, path: str) -> list[dict[str, Any]]:
         raise UnsupportedCapability(self.backend, "filesystem_extended")
 
@@ -118,6 +127,12 @@ class SandboxAdapter(ABC):
     def clone(self, n: int = 1, *, concurrency: int = 1) -> list["SandboxAdapter"]:
         raise UnsupportedCapability(self.backend, "rollback_clone")
 
+    def fork(
+        self, count: int = 1, *, timeout: int | None = None
+    ) -> list[tuple["SandboxAdapter" | None, Exception | None]]:
+        """Server-side fork: one entry per requested fork, success or failure."""
+        raise UnsupportedCapability(self.backend, "fork")
+
     def list_snapshot_ids(self) -> set[str]:
         raise UnsupportedCapability(self.backend, "rollback_clone")
 
@@ -126,6 +141,12 @@ class SandboxAdapter(ABC):
 
     def traffic_access_token(self) -> str | None:
         raise UnsupportedCapability(self.backend, "network_public_access")
+
+    def mcp_url(self) -> str:
+        raise UnsupportedCapability(self.backend, "mcp_gateway")
+
+    def mcp_token(self) -> str | None:
+        raise UnsupportedCapability(self.backend, "mcp_gateway")
 
     def update_network(self, network: dict | None = None) -> None:
         """Replace the egress policy of the running sandbox.

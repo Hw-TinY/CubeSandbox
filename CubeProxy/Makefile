@@ -1,4 +1,4 @@
-IMAGE_TAG           ?= v0.7.2-rc3
+IMAGE_TAG           ?= v0.7.3
 IMAGE_LOCAL         := cube-proxy
 
 # Base OpenResty image; overridable for private mirrors / pinned digests.
@@ -47,14 +47,16 @@ test:
 		lua tests/sandbox_backend_cache_test.lua; \
 		lua tests/sandbox_route_lookup_test.lua; \
 		lua tests/request_host_test.lua; \
+		lua tests/rewrite_phase_route_test.lua; \
 	elif command -v luajit >/dev/null 2>&1; then \
 		luajit tests/redis_iresty_sentinel_test.lua; \
 		luajit tests/backend_cache_test.lua; \
 		luajit tests/sandbox_backend_cache_test.lua; \
 		luajit tests/sandbox_route_lookup_test.lua; \
 		luajit tests/request_host_test.lua; \
+		luajit tests/rewrite_phase_route_test.lua; \
 	else \
-		echo "skip lua unit tests (no lua/luajit): redis_iresty_sentinel_test.lua backend_cache_test.lua sandbox_backend_cache_test.lua sandbox_route_lookup_test.lua request_host_test.lua"; \
+		echo "skip lua unit tests (no lua/luajit): redis_iresty_sentinel_test.lua backend_cache_test.lua sandbox_backend_cache_test.lua sandbox_route_lookup_test.lua request_host_test.lua rewrite_phase_route_test.lua"; \
 	fi
 
 # Push the architecture-specific image to all registries.

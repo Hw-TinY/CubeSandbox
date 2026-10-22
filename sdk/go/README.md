@@ -19,6 +19,10 @@ export CUBE_PROXY_NODE_IP=<cubeproxy-node-ip>
 export CUBE_PROXY_PORT_HTTP=80
 export CUBE_PROXY_SCHEME=http
 export CUBE_SANDBOX_DOMAIN=cube.app
+
+# Template tried first when CreateOptions.MCP is set and TemplateID is empty;
+# CUBE_TEMPLATE_ID is used if it does not exist.
+export CUBE_MCP_TEMPLATE_ID=mcp-gateway
 ```
 
 `NewConfigFromEnv` also accepts `E2B_API_URL` and `E2B_API_KEY`; `CUBE_API_URL` and `CUBE_API_KEY` take precedence.
@@ -131,6 +135,7 @@ Consume output via **either** `Output()` **or** `Wait(onData)`, not both — the
 ```go
 // Read & write
 content, err := sb.Files().Read(ctx, "/etc/hosts")
+png, err := sb.Files().ReadBytes(ctx, "/tmp/chart.png")
 err = sb.Files().Write(ctx, "/tmp/hello.txt", []byte("hi"))
 
 // Execute all filesystem operations as a specific sandbox user.
@@ -166,7 +171,9 @@ for ev := range watcher.Events {
 | Method | Description |
 |---|---|
 | `ForUser(user)` | Return an immutable view that runs all filesystem operations as `user` |
-| `Read(ctx, path)` | Download file content via `GET /files` |
+| `Read(ctx, path)` | Download file content as text via `GET /files` (e2b `format=text`) |
+| `ReadBytes(ctx, path)` | Download raw bytes (e2b `format=bytes`) |
+| `ReadStream(ctx, path)` | Stream download; caller must `Close` (e2b `format=stream`) |
 | `Write(ctx, path, data)` | Upload via `POST /files` (octet-stream, multipart fallback) |
 | `WriteFiles(ctx, entries)` | Batch write, stops on first error, returns count |
 | `List(ctx, path)` | List directory entries via `ListDir` RPC |
@@ -192,9 +199,14 @@ err = client.DeleteSnapshot(ctx, snap.SnapshotID) // DELETE /templates/:id
 _, err = sb.Rollback(ctx, snap.SnapshotID) // POST /sandboxes/:id/rollback
 
 clones, err := sb.Clone(ctx, cubesandbox.CloneOptions{N: 3, Concurrency: 3})
+
+// One server-side call: the backend snapshots sb once and derives N copies.
+forks, err := sb.Fork(ctx, cubesandbox.ForkOptions{Count: cubesandbox.IntPtr(3)})
 ```
 
 `Clone` snapshots the sandbox, creates `N` sandboxes from it (capped by `Concurrency`), then deletes the ephemeral snapshot. If any create fails, all successful siblings are killed and the first error is returned. `Rollback` restarts the sandbox process and drops pooled data-plane connections so the next call reconnects.
+
+`Fork` returns exactly `Count` entries — each a `ForkResult` with the derived `Sandbox` or that fork's error — so partial success keeps copies without failing the call (unlike `Clone`). `Count` is 1..100, default 1 (`IntPtr` for a value, nil = default); `Timeout` is a `time.Duration` idle TTL per fork. The temporary snapshot is server-managed.
 
 ## Volumes
 
@@ -272,6 +284,21 @@ _ = resumed
 ```
 
 `Sandbox.Resume` is available for compatibility but deprecated; prefer `Client.Connect`.
+
+## MCP Gateway (Preview)
+
+Set `MCP` to start an E2B-compatible MCP gateway inside the sandbox. It needs a template that ships `mcp-gateway`; when `TemplateID` is empty, the alias `mcp-gateway` is tried first (override with `CUBE_MCP_TEMPLATE_ID` or `Config.MCPTemplateID`), then `CUBE_TEMPLATE_ID` if that template does not exist. An error matching `ErrTemplateNotFound` is returned when neither exists. A failed start returns an error wrapping `ErrMCPGateway` and kills the sandbox. See [MCP Gateway](../../docs/guide/mcp-gateway.md).
+
+```go
+sb, err := client.Create(ctx, cubesandbox.CreateOptions{
+	MCP: cubesandbox.MCPServers{"duckduckgo": map[string]any{}},
+})
+if err != nil {
+	return err
+}
+url := sb.GetMCPURL()               // streamable HTTP endpoint
+token, err := sb.GetMCPToken(ctx)   // send as "Authorization: Bearer <token>"
+```
 
 ## Network Policy
 

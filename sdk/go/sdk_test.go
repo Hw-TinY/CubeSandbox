@@ -4,6 +4,7 @@
 package cubesandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -16,6 +17,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -820,6 +823,58 @@ func TestFilesReadUsesEnvdHTTPFileAPI(t *testing.T) {
 	}
 }
 
+func TestFilesReadBytesPreservesBinary(t *testing.T) {
+	png := []byte{0x89, 0x50, 0x4e, 0x47}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/files" {
+			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+		}
+		w.Write(png)
+	}))
+	defer server.Close()
+
+	host, port := serverHostPort(t, server.URL)
+	client := NewClient(Config{
+		ProxyNodeIP:    host,
+		ProxyPortHTTP:  port,
+		SandboxDomain:  "cube.test",
+		RequestTimeout: time.Second,
+	})
+	sb := &Sandbox{client: client, SandboxID: "sb-bin", TemplateID: "tpl-test"}
+
+	got, err := sb.Files().ReadBytes(context.Background(), "/tmp/x.png")
+	if err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	if !bytes.Equal(got, png) {
+		t.Fatalf("got=%x want=%x", got, png)
+	}
+
+	stream, err := sb.Files().ReadStream(context.Background(), "/tmp/x.png")
+	if err != nil {
+		t.Fatalf("ReadStream: %v", err)
+	}
+	defer stream.Close()
+	streamed, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(streamed, png) {
+		t.Fatalf("streamed=%x want=%x", streamed, png)
+	}
+
+	// Go strings hold arbitrary bytes (unlike JS/Python UTF-8 text paths), so
+	// Read still round-trips binary. ReadBytes is the e2b format=bytes surface
+	// for callers that want an explicit []byte API.
+	textContent, err := sb.Files().Read(context.Background(), "/tmp/x.png")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !bytes.Equal([]byte(textContent), png) {
+		t.Fatalf("Read round-trip=%x want=%x", []byte(textContent), png)
+	}
+}
+
 func TestFilesReadReturnsEnvdFileError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"file not found"}`, http.StatusNotFound)
@@ -886,14 +941,37 @@ type fakeFileReader struct {
 	path    string
 	user    string
 	content string
+	raw     []byte
 	err     error
 }
 
-func (r *fakeFileReader) readFile(_ context.Context, path string, options ...fileRequestOption) (string, error) {
+func (r *fakeFileReader) readFile(ctx context.Context, path string, options ...fileRequestOption) (string, error) {
+	raw, err := r.readFileBytes(ctx, path, options...)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func (r *fakeFileReader) readFileBytes(_ context.Context, path string, options ...fileRequestOption) ([]byte, error) {
 	r.path = path
 	opts := resolveFileRequestOptions(options...)
 	r.user = opts.user
-	return r.content, r.err
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.raw != nil {
+		return append([]byte(nil), r.raw...), nil
+	}
+	return []byte(r.content), nil
+}
+
+func (r *fakeFileReader) openFileStream(ctx context.Context, path string, options ...fileRequestOption) (io.ReadCloser, error) {
+	raw, err := r.readFileBytes(ctx, path, options...)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(raw)), nil
 }
 
 func connectEnvelope(flags byte, payload string) []byte {
@@ -925,6 +1003,12 @@ func clearEnv(t *testing.T) {
 
 func sandboxJSON(sandboxID, templateID string) string {
 	return fmt.Sprintf(`{"sandboxID":%q,"templateID":%q,"clientID":"client-1","envdVersion":"0.0.1","domain":"cube.app"}`, sandboxID, templateID)
+}
+
+// sandboxField renders the `"sandbox":{...}` fragment inside one element of a
+// server-side fork response array.
+func sandboxField(sandboxID string) string {
+	return `"sandbox":` + sandboxJSON(sandboxID, "tpl-test")
 }
 
 func sandboxInfoJSON(sandboxID, state string) string {
@@ -1452,6 +1536,175 @@ func TestFilesWatchDirErrorFromServer(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected error on Errors channel")
+	}
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	closeCount int32
+}
+
+func (t *trackingReadCloser) Close() error {
+	atomic.AddInt32(&t.closeCount, 1)
+	return nil
+}
+
+func TestWatcherClosesBodyExactlyOnce(t *testing.T) {
+	body := &trackingReadCloser{
+		Reader: bytes.NewReader(connectEnvelope(connectEndStreamFlag, `{}`)),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan WatchEvent, 64)
+	errs := make(chan error, 1)
+	w := &Watcher{
+		Events: events,
+		Errors: errs,
+		events: events,
+		errs:   errs,
+		ctx:    ctx,
+		cancel: cancel,
+		body:   body,
+	}
+
+	w.readLoop()
+
+	// After readLoop exits on natural stream end, Close() should be a no-op
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if count := atomic.LoadInt32(&body.closeCount); count != 1 {
+		t.Fatalf("expected body to be closed exactly once, got %d", count)
+	}
+}
+
+func TestWatcherConcurrentClose(t *testing.T) {
+	pr, pw := io.Pipe()
+	body := &trackingReadCloser{
+		Reader: pr,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan WatchEvent, 64)
+	errs := make(chan error, 1)
+	w := &Watcher{
+		Events: events,
+		Errors: errs,
+		events: events,
+		errs:   errs,
+		ctx:    ctx,
+		cancel: cancel,
+		body:   body,
+	}
+
+	go w.readLoop()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = w.Close()
+		}()
+	}
+
+	_ = pw.Close()
+	wg.Wait()
+
+	if count := atomic.LoadInt32(&body.closeCount); count != 1 {
+		t.Fatalf("expected body to be closed exactly once under concurrent Close(), got %d", count)
+	}
+}
+
+type errCloser struct {
+	io.Reader
+	err error
+}
+
+func (e *errCloser) Close() error {
+	return e.err
+}
+
+func TestWatcherCloseErrorPreserved(t *testing.T) {
+	expectedErr := errors.New("underlying close failed")
+	body := &errCloser{
+		Reader: bytes.NewReader(connectEnvelope(connectEndStreamFlag, `{}`)),
+		err:    expectedErr,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan WatchEvent, 64)
+	errs := make(chan error, 1)
+	w := &Watcher{
+		Events: events,
+		Errors: errs,
+		events: events,
+		errs:   errs,
+		ctx:    ctx,
+		cancel: cancel,
+		body:   body,
+	}
+
+	w.readLoop()
+
+	// Both first Close() and subsequent Close() calls should reliably return the captured closeErr
+	if err := w.Close(); !errors.Is(err, expectedErr) {
+		t.Fatalf("expected %v, got %v", expectedErr, err)
+	}
+	if err := w.Close(); !errors.Is(err, expectedErr) {
+		t.Fatalf("expected subsequent Close() to preserve %v, got %v", expectedErr, err)
+	}
+}
+
+func TestFilesWatchDirConcurrentCloseLiveServer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", connectContentType)
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		w.Write(connectFrame(0, []byte(`{"start":{}}`)))
+		flusher.Flush()
+
+		// Stream events until client disconnects
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_, _ = w.Write(connectFrame(0, []byte(`{"filesystem":{"name":"x.txt","type":"EVENT_TYPE_CREATE"}}`)))
+				flusher.Flush()
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := serverHostPort(t, server.URL)
+	client := NewClient(Config{ProxyNodeIP: host, ProxyPortHTTP: port, SandboxDomain: "cube.test", RequestTimeout: 5 * time.Second})
+	sb := &Sandbox{client: client, SandboxID: "sb-fs-concurrent"}
+
+	watcher, err := sb.Files().WatchDir(context.Background(), "/tmp")
+	if err != nil {
+		t.Fatalf("WatchDir: %v", err)
+	}
+
+	// Consume at least 1 event to ensure stream is active
+	<-watcher.Events
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = watcher.Close()
+		}()
+	}
+
+	wg.Wait()
+
+	// Drain remaining events safely
+	for range watcher.Events {
 	}
 }
 

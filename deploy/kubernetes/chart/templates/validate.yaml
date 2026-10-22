@@ -269,6 +269,9 @@ away from CubeMaster means one of the two Pods cannot attach the volume.
 {{- if and (eq .Values.cubeProxy.tls.mode "certManager") (not .Values.cubeProxy.tls.certManager.issuerRef.name) }}
 {{- fail "cubeProxy.tls.mode=certManager requires cubeProxy.tls.certManager.issuerRef.name" }}
 {{- end }}
+{{- if and (eq .Values.cubeProxy.tls.mode "selfSigned") (not (kindIs "bool" ((default dict .Values.cubeProxy.tls.selfSigned).rotateOnSanChange | default false))) }}
+{{- fail "cubeProxy.tls.selfSigned.rotateOnSanChange must be a boolean" }}
+{{- end }}
 {{- $clbSecurityGroups := index (default dict .Values.cubeProxy.service.annotations) "service.cloud.tencent.com/security-groups" | default "" -}}
 {{- if and (eq (.Values.cubeProxy.service.type | default "ClusterIP") "LoadBalancer") (hasPrefix "CHANGE_ME" $clbSecurityGroups) }}
 {{- fail "cubeProxy.service.annotations[\"service.cloud.tencent.com/security-groups\"] still equals the CHANGE_ME_* sentinel from values-tke.yaml. Override it with your VPC security group id(s) (comma-separated), or set it to \"\" if you manage CLB security groups outside Helm." }}
@@ -305,6 +308,9 @@ away from CubeMaster means one of the two Pods cannot attach the volume.
 {{- end }}
 {{- if and .Values.cubeProxy.ingress.enabled (not .Values.cubeProxy.domain) (not .Values.cubeProxy.ingress.hosts) }}
 {{- fail "cubeProxy.ingress.enabled=true requires cubeProxy.domain or cubeProxy.ingress.hosts" }}
+{{- end }}
+{{- if and .Values.cubeProxy.domain (hasPrefix "*." .Values.cubeProxy.domain) }}
+{{- fail "cubeProxy.domain must be the base domain (for example sandbox.example.com), not a wildcard" }}
 {{- end }}
 {{- if ne (include "cube.lifecycleManagerEnabled" .) "true" }}
 {{- fail "cubeProxy.enabled=true requires lifecycleManager.enabled=true (cube-lifecycle-manager replaces the obsolete cube-proxy-sidecar)" }}
@@ -359,7 +365,6 @@ away from CubeMaster means one of the two Pods cannot attach the volume.
 {{- fail "cubeOps.enabled=true requires images.ops.repository" }}
 {{- end }}
 {{- end }}
-{{- if .Values.cubeEgress.enabled }}
 {{- if not (has .Values.cubeEgress.ca.mode (list "existingSecret" "selfSigned" "inline")) }}
 {{- fail "cubeEgress.ca.mode must be one of: existingSecret, selfSigned, inline" }}
 {{- end }}
@@ -369,9 +374,8 @@ away from CubeMaster means one of the two Pods cannot attach the volume.
 {{- if and (eq .Values.cubeEgress.ca.mode "inline") (or (not .Values.cubeEgress.ca.inline.rootCert) (not .Values.cubeEgress.ca.inline.rootKey) (not .Values.cubeEgress.ca.inline.placeholderCert) (not .Values.cubeEgress.ca.inline.placeholderKey)) }}
 {{- fail "cubeEgress.ca.mode=inline requires rootCert, rootKey, placeholderCert, and placeholderKey" }}
 {{- end }}
-{{- if and .Values.cubeEgress.network.enabled (not .Values.cubeEgress.network.ingressInterface) }}
-{{- fail "cubeEgress.network.enabled=true requires cubeEgress.network.ingressInterface" }}
-{{- end }}
+{{- if not .Values.cubeEgress.network.ingressInterface }}
+{{- fail "cubeEgress.network.ingressInterface is required" }}
 {{- end }}
 {{- if .Values.volumeCos.enabled }}
 {{- if and (not .Values.volumeCos.existingSecret) (or (not .Values.volumeCos.secretId) (not .Values.volumeCos.secretKey) (not .Values.volumeCos.bucket)) }}
@@ -457,5 +461,25 @@ away from CubeMaster means one of the two Pods cannot attach the volume.
 {{- end }}
 {{- if and (ne $opsEndpoint "") (not $hasOpsCreds) }}
 {{- fail "cubeOps S3 endpoint is set but no credentials: set cubeOps.s3.existingSecret (keys s3-access-key-id / s3-secret-access-key), cubeOps.s3.accessKeyId+secretAccessKey, or volumeS3.accessKeyId+secretAccessKey. volumeS3.existingSecret (volume-s3.conf) is not a CubeOps credential source." }}
+{{- end }}
+{{- end }}
+{{- if and .Values.trustedCACerts.enabled .Values.controlPlane.enabled }}
+{{- $tc := .Values.trustedCACerts }}
+{{- if and (empty $tc.certs) (empty $tc.existingConfigMap) }}
+{{- fail "trustedCACerts.enabled=true requires certs or existingConfigMap -- without either the feature renders nothing and every private-registry pull keeps failing with x509" }}
+{{- end }}
+{{- if and (not (empty $tc.certs)) (not (empty $tc.existingConfigMap)) }}
+{{- fail "trustedCACerts.certs and trustedCACerts.existingConfigMap are mutually exclusive: inline certs render a chart-managed ConfigMap; existingConfigMap references one you own" }}
+{{- end }}
+{{- /* One render-time content guard: every PEM block must be a CERTIFICATE.
+     A pasted private key would otherwise ship inside the ConfigMap; this is
+     the only content check (deliberately no symmetry/prose-marker/size
+     duplicates). */ -}}
+{{- range $i, $pem := $tc.certs }}
+{{- range $m := regexFindAll "(?mi)^-----BEGIN [A-Z ]+-----" $pem -1 }}
+{{- if not (regexMatch "^-----BEGIN CERTIFICATE-----[[:space:]]*$" (trim $m)) }}
+{{- fail (printf "trustedCACerts.certs[%d] contains a non-CERTIFICATE PEM block (%s) -- certificate blocks only; a pasted private key must not reach the registry-facing pod" $i (trim $m)) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

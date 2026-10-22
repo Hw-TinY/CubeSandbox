@@ -58,6 +58,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/controller/runtemplate/templatetypes"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/recov"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/restartpolicy"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/taskio"
@@ -141,32 +142,48 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 			return ret.Err(errorcode.ErrorCode_PreConditionFailed, "already exists")
 		}
 	}
+	// Restart keeps the previous row on purpose; Save overwrites it.
 	// Resume-from-pause reuses the same sandboxID. Only a fully PAUSED tombstone
 	// may be replaced (not PAUSING — pause may still own the lifecycle lock /
 	// cleanup). Reject PAUSING and other non-paused collisions as already exists.
-	if desired := strings.TrimSpace(realReq.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID]); desired != "" {
-		if sb, err := l.cubeboxManger.Get(ctx, desired); err == nil && sb != nil && sb.SandboxID == desired {
-			st := sb.GetStatus()
-			if st != nil && st.Get().State() == cubebox.ContainerState_CONTAINER_PAUSED {
-				// CDP user-delete hook requires UserMarkDeletedTime before store delete.
-				if sb.UserMarkDeletedTime == nil {
-					now := time.Now()
-					sb.UserMarkDeletedTime = &now
-					_ = l.cubeboxManger.SyncByID(ctx, desired)
-				}
-				// Pause post-cleanup may leave containerd metadata; wipe before recreate.
-				_ = runc.Clean(ctx, desired)
-				for _, id := range pausedTombstoneContainerIDs(sb) {
-					if err := l.client.ContainerService().Delete(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-						log.G(ctx).Warnf("replace paused sandbox: delete containerd %s: %v", id, err)
+	if !workflow.ReuseFor(opts).CubeboxMeta {
+		if desired := strings.TrimSpace(realReq.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID]); desired != "" {
+			if sb, err := l.cubeboxManger.Get(ctx, desired); err == nil && sb != nil && sb.SandboxID == desired {
+				st := sb.GetStatus()
+				if st != nil && st.Get().State() == cubebox.ContainerState_CONTAINER_PAUSED {
+					// Everything below deletes the old sandbox's records, and this
+					// row is the last place its shim identity survives: once it is
+					// gone nothing on the host can match a still-running shim back
+					// to the sandbox, and this attempt is handed a tap the old one
+					// may still hold. So the eligibility wait runs before any of
+					// this, at the create entry point — see gatePausedReplace in
+					// service.go — and is deliberately not repeated here, where it
+					// would run after the records it protects are already gone.
+					// Resume replaces the paused row. Keep the restart bookkeeping
+					// so the next report is newer than the one CubeMaster already has.
+					if sb.RestartState != "" || sb.StatusSeq != 0 || sb.RestartCount != 0 || len(sb.OriginalRequest) > 0 {
+						opts.RestartPrior = restartPriorFrom(sb)
 					}
+					// CDP user-delete hook requires UserMarkDeletedTime before store delete.
+					if sb.UserMarkDeletedTime == nil {
+						now := time.Now()
+						sb.UserMarkDeletedTime = &now
+						_ = l.cubeboxManger.SyncByID(ctx, desired)
+					}
+					// Pause post-cleanup may leave containerd metadata; wipe before recreate.
+					_ = runc.Clean(ctx, desired)
+					for _, id := range pausedTombstoneContainerIDs(sb) {
+						if err := l.client.ContainerService().Delete(ctx, id); err != nil && !errdefs.IsNotFound(err) {
+							log.G(ctx).Warnf("replace paused sandbox: delete containerd %s: %v", id, err)
+						}
+					}
+					if delErr := l.cubeboxManger.Delete(ctx, &cubes.DeleteOption{CubeboxID: desired}); delErr != nil {
+						return ret.Errorf(errorcode.ErrorCode_PreConditionFailed,
+							"failed to replace paused sandbox %s: %v", desired, delErr)
+					}
+				} else {
+					return ret.Err(errorcode.ErrorCode_PreConditionFailed, "already exists")
 				}
-				if delErr := l.cubeboxManger.Delete(ctx, &cubes.DeleteOption{CubeboxID: desired}); delErr != nil {
-					return ret.Errorf(errorcode.ErrorCode_PreConditionFailed,
-						"failed to replace paused sandbox %s: %v", desired, delErr)
-				}
-			} else {
-				return ret.Err(errorcode.ErrorCode_PreConditionFailed, "already exists")
 			}
 		}
 	}
@@ -216,6 +233,17 @@ type createContainerParam struct {
 	cntrReq *cubebox.ContainerConfig
 }
 
+// persistCreateResult turns a failed sandbox save into a create failure, and
+// leaves an earlier create error in place. A save failure must not be reported
+// as success, and it must not hide the error that already failed the create.
+func persistCreateResult(sandboxID string, retE, saveErr error) error {
+	if saveErr == nil || retE != nil {
+		return retE
+	}
+	return ret.Err(errorcode.ErrorCode_UpdateLocalMetaDataFailed,
+		fmt.Sprintf("persist sandbox %s after create: %v", sandboxID, saveErr))
+}
+
 func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateContext) error {
 	realReq := flowOpts.ReqInfo
 
@@ -245,6 +273,17 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 		RuntimeHandler:    realReq.GetRuntimeHandler(),
 		ExposedPorts:      append([]int64(nil), realReq.GetExposedPorts()...),
 		CubeNetworkConfig: cloneCubeNetworkConfig(realReq.GetCubeNetworkConfig()),
+	}
+	if flowOpts.RestartPrior != nil && (flowOpts.IsRestart || flowOpts.RestartPrior.StatusSeq != 0 || flowOpts.RestartPrior.RestartCount != 0 || flowOpts.RestartPrior.LastExitReason != "" || len(flowOpts.RestartPrior.OriginalRequest) > 0) {
+		applyRestartBookkeeping(sandBox, flowOpts.RestartPrior, flowOpts.IsRestart)
+		if flowOpts.IsPauseResume() {
+			clearRestartCountForResume(sandBox)
+		}
+	} else if restartpolicy.KeepsRequest(realReq.GetRestartPolicy()) {
+		if err := sandBox.SetOriginalRequest(realReq); err != nil {
+			return err
+		}
+		sandBox.RestartState = restartpolicy.StateRunning
 	}
 	if sandBox.Metadata.Labels == nil {
 		sandBox.Metadata.Labels = make(map[string]string)
@@ -379,12 +418,17 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 		})
 	}
 
-	if err := func() error {
+	if err := func() (retE error) {
 		sandBox.Lock()
 		defer func() {
-			if err := l.cubeboxManger.Save(ctx, sandBox); err != nil {
-				log.G(ctx).Warnf("saveSandBoxInfo failed.%s", err.Error())
+			saveErr := l.cubeboxManger.Save(ctx, sandBox)
+			if saveErr != nil {
+				log.G(ctx).Warnf("saveSandBoxInfo failed.%s", saveErr.Error())
 			}
+			// The record this Save writes is what destroy reads to decide
+			// whether a shim may still hold the sandbox's resources, so
+			// losing it must not be reported as a successful create.
+			retE = persistCreateResult(sandBox.ID, retE, saveErr)
 			sandBox.Unlock()
 		}()
 
@@ -601,9 +645,11 @@ func (l *local) createCubeboxContainer(ctx context.Context, flowOpts *workflow.C
 				Namespace:    sandBox.Namespace,
 				InstanceType: realReq.GetInstanceType(),
 			},
-			IP:     sandBox.IP,
-			Status: cubeboxstore.StoreStatus(cubeboxstore.Status{CreatedAt: createdAt}),
-			IsPod:  isPod,
+			IP:              sandBox.IP,
+			Status:          cubeboxstore.StoreStatus(cubeboxstore.Status{CreatedAt: createdAt}),
+			IsPod:           isPod,
+			RequestIndex:    i,
+			RequestIndexSet: true,
 		}
 
 		if set := cntrReq.GetAnnotations()[constants.AnnotationsDebugStdout]; set == "true" {
@@ -632,6 +678,14 @@ func (l *local) createCubeboxContainer(ctx context.Context, flowOpts *workflow.C
 func (l *local) generateContainerID(ctx context.Context, flowOpts *workflow.CreateContext, index int) (context.Context, string) {
 	var cid string
 	ctxTmp := context.WithValue(ctx, constants.KCubeIndexContext, strconv.Itoa(index))
+	if saved := flowOpts.SavedContainerIDs[index]; saved != "" {
+		if index == 0 {
+			ctxTmp = context.WithValue(ctxTmp, CubeLog.KeyFunctionType, constants.ContainerTypeSandBox)
+		} else {
+			ctxTmp = context.WithValue(ctxTmp, CubeLog.KeyFunctionType, constants.ContainerTypeContainer)
+		}
+		return ctxTmp, saved
+	}
 	if index == 0 {
 		ctxTmp = context.WithValue(ctxTmp, CubeLog.KeyFunctionType, constants.ContainerTypeSandBox)
 		cid = flowOpts.GetSandboxID()
@@ -904,6 +958,9 @@ func (l *local) containerSpec(ctx context.Context, sandBox *cubeboxstore.CubeBox
 		if err != nil {
 
 			return nil, err
+		}
+		if containerdImage == nil {
+			return nil, ret.Err(errorcode.ErrorCode_ResolveLocalSpecFailed, "container image is empty")
 		}
 		cOpts = append(cOpts,
 			containerd.WithSnapshotter(sandBox.OciRuntime.Snapshotter),
@@ -1208,6 +1265,25 @@ func (l *local) prepareVolumePmemsMounts(ctx context.Context, flowOpts *workflow
 	return append([]oci.SpecOpts{}, oci.WithMounts(mounts)), nil
 }
 
+// writableLayerSubdir is the ext4 directory the guest mounts as the overlay upper.
+// A template memory snapshot already has that mount: the template sandbox id is
+// <templateID>_<index>, and restore reconnects the existing process instead of
+// calling setup_bundle, so guest writes land in that directory on the cloned
+// volume. A restart cold-boots and must mount the same directory. A sandbox
+// that did not come from a template keeps using its container id.
+func writableLayerSubdir(flowOpts *workflow.CreateContext, containerID, index string) string {
+	if flowOpts != nil && flowOpts.IsRestart && flowOpts.ReqInfo != nil {
+		templateID := strings.TrimSpace(flowOpts.ReqInfo.GetAnnotations()[constants.MasterAnnotationAppSnapshotTemplateID])
+		if templateID != "" {
+			if strings.TrimSpace(index) == "" {
+				index = "0"
+			}
+			return "disk/" + templateID + "_" + index
+		}
+	}
+	return "disk/" + containerID
+}
+
 func (l *local) prepareWritableRootfs(ctx context.Context, flowOpts *workflow.CreateContext, containerReq *cubebox.ContainerConfig,
 ) (oci.SpecOpts, error) {
 	if containerReq.GetSecurityContext().GetReadonlyRootfs() {
@@ -1250,7 +1326,8 @@ func (l *local) prepareWritableRootfs(ctx context.Context, flowOpts *workflow.Cr
 
 	annotations := make(map[string]string)
 	annotations[constants.AnnotationsRootfsWritableKey] = blkPath
-	annotations[constants.AnnotationsRootfsWlayerSubdir] = "disk/" + containerReq.GetId()
+	index, _ := ctx.Value(constants.KCubeIndexContext).(string)
+	annotations[constants.AnnotationsRootfsWlayerSubdir] = writableLayerSubdir(flowOpts, containerReq.GetId(), index)
 	log.G(ctx).Debugf("writable rootfs:%+v", blkPath)
 
 	return oci.WithAnnotations(annotations), nil
@@ -1322,7 +1399,11 @@ func (l *local) runContainer(
 	ociRuntime cubeconfig.Runtime) (err error) {
 
 	start := time.Now()
-	c, err := l.client.NewContainer(ctx, ci.ID, cOpts...)
+	newContainer := l.newContainerFn
+	if newContainer == nil {
+		newContainer = l.client.NewContainer
+	}
+	c, err := newContainer(ctx, ci.ID, cOpts...)
 	if err != nil {
 		workflow.RecordCreateMetric(ctx, ret.Err(errorcode.ErrorCode_NewContainerMetaDataFailed, err.Error()),
 			constants.CubeNewContainerId, time.Since(start))
@@ -1350,6 +1431,44 @@ func (l *local) runContainer(
 			containerd.WithTaskAPIEndpoint(endpoint.Address, endpoint.Version))
 	}
 
+	// Record the intent to spawn a shim before NewTask, and persist it right
+	// away. Everything below can fail or be interrupted while the shim keeps
+	// running; without this flag the destroy path cannot tell that apart from
+	// a sandbox whose shim never started, and would release the tap/IP while
+	// the process still holds them.
+	//
+	// The recorded pid is cleared at the same time. On resume it still holds
+	// the previous incarnation, which has already exited — leaving it in place
+	// would let the destroy path check that dead pid, find it gone, and clear
+	// the sandbox while the shim started just below is alive.
+	//
+	// The timestamp is what keeps the flag from being a one-way door: the
+	// destroy path treats an intent older than the configured TTL as stale
+	// bookkeeping, so a record that never gets as far as a pid cannot block
+	// cleanup for the life of the host.
+	//
+	// Written unconditionally rather than only when the endpoint is not already
+	// in the intent shape: a retry must refresh the age, and a stale pid from a
+	// previous incarnation must always be dropped here.
+	withdrawIntent := func() {}
+	if ci.IsPod {
+		cubebox.Endpoint.ShimSpawned = true
+		cubebox.Endpoint.ShimSpawnedAt = time.Now()
+		cubebox.Endpoint.Pid = 0
+		cubebox.Endpoint.PidStartTime = 0
+		if err := l.cubeboxManger.Save(ctx, cubebox, cubes.WithNoEvent); err != nil {
+			return ret.Err(errorcode.ErrorCode_UpdateLocalMetaDataFailed,
+				fmt.Sprintf("record shim intent for %s: %v", ci.ID, err))
+		}
+		// Every return below now has to reconcile this record with what
+		// actually happened: a handled failure means the intent is the only
+		// trace, and leaving it behind is what made such a sandbox
+		// un-reclaimable. withdrawIntent is cleared once the real endpoint is
+		// durable.
+		withdrawIntent = func() { l.withdrawShimIntent(ctx, cubebox, ci) }
+		defer func() { withdrawIntent() }()
+	}
+
 	taskStart := time.Now()
 	task, err := c.NewTask(ctx, ioCreater, taskOpts...)
 	if err != nil {
@@ -1365,11 +1484,32 @@ func (l *local) runContainer(
 		}
 		ep, v := shim.Endpoint()
 
-		cubebox.Endpoint = sandboxstore.Endpoint{
-			Address: ep,
-			Version: uint32(v),
-			Pid:     task.Pid(),
+		pid := task.Pid()
+		// A bare pid is not an identity: pid numbers get recycled. Capture the
+		// process start time alongside it so a later liveness check can tell
+		// our shim from a stranger that inherited the number.
+		startTime, err := readShimStartTime(ctx, ci.ID, int(pid))
+		if err != nil {
+			return ret.Err(errorcode.ErrorCode_LoadUserProcTimeout, err.Error())
 		}
+
+		cubebox.Endpoint = sandboxstore.Endpoint{
+			Address:       ep,
+			Version:       uint32(v),
+			Pid:           pid,
+			PidStartTime:  startTime,
+			ShimSpawned:   true,
+			ShimSpawnedAt: cubebox.Endpoint.ShimSpawnedAt,
+		}
+		// Persist the endpoint here, not only in the caller's deferred Save.
+		// That Save logs and moves on, and a sandbox left as {ShimSpawned,
+		// Pid: 0} is exactly the state that has no exit — a running shim whose
+		// identity the destroy path can never establish.
+		if err := l.cubeboxManger.Save(ctx, cubebox, cubes.WithNoEvent); err != nil {
+			return ret.Err(errorcode.ErrorCode_UpdateLocalMetaDataFailed,
+				fmt.Sprintf("persist shim endpoint for %s: %v", ci.ID, err))
+		}
+		withdrawIntent = func() {}
 	}
 
 	exitCh, err := task.Wait(ctx)
@@ -1391,6 +1531,97 @@ func (l *local) runContainer(
 		constants.CubeShimStartId,
 		time.Since(taskStart))
 	return nil
+}
+
+// shimIdentityReadAttempts bounds how long we try to read the shim's start
+// time before giving up on the create. The read races the process's own exit,
+// and a short retry costs nothing next to storing an identity we could not
+// read: PidStartTime 0 leaves the record in the "provenance unknown" shape for
+// the sandbox's whole life, and every later liveness check has to guess.
+const shimIdentityReadAttempts = 3
+
+// shimIdentityRetryDelay is the pause between those attempts.
+const shimIdentityRetryDelay = 50 * time.Millisecond
+
+func readShimStartTime(ctx context.Context, shimID string, pid int) (uint64, error) {
+	var lastErr error
+	for attempt := 1; attempt <= shimIdentityReadAttempts; attempt++ {
+		identity, err := utils.ReadProcessIdentity(pid)
+		if err == nil {
+			return identity.StartTime, nil
+		}
+		lastErr = err
+		if attempt == shimIdentityReadAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("read identity of shim %s (pid %d): %w", shimID, pid, ctx.Err())
+		case <-time.After(shimIdentityRetryDelay):
+		}
+	}
+	log.G(ctx).Errorf("read identity of shim %s (pid %d) failed after %d attempts: %v",
+		shimID, pid, shimIdentityReadAttempts, lastErr)
+	return 0, fmt.Errorf("read identity of shim %s (pid %d) after %d attempts: %w",
+		shimID, pid, shimIdentityReadAttempts, lastErr)
+}
+
+// withdrawShimIntent puts the endpoint record back to "no shim was spawned"
+// after a create failed with the intent already written.
+//
+// It refuses to do so while a live process can still be found for the sandbox.
+// The flag is then the only thing stopping the destroy path from releasing a
+// tap, IP and volumes that process is holding, so "we failed to record a pid"
+// must not be downgraded to "nothing was ever spawned".
+func (l *local) withdrawShimIntent(ctx context.Context, sb *cubeboxstore.CubeBox, ci *cubeboxstore.Container) {
+	if sb == nil {
+		return
+	}
+	if holder, ok := l.liveBundleHolder(ctx, sb); ok {
+		log.G(ctx).Errorf("shim intent for %s kept: pid %d from %s is still running; "+
+			"refusing to declare the sandbox unspawned", sandboxIdentity(sb), holder.pid, holder.source)
+		return
+	}
+	sb.Endpoint.ShimSpawned = false
+	sb.Endpoint.ShimSpawnedAt = time.Time{}
+	sb.Endpoint.Pid = 0
+	sb.Endpoint.PidStartTime = 0
+	if err := l.cubeboxManger.Save(ctx, sb, cubes.WithNoEvent); err != nil {
+		log.G(ctx).Errorf("withdraw shim intent for %s: %v; cleanup will refuse to reclaim it until "+
+			"the intent TTL expires", sandboxIdentity(sb), err)
+	}
+	log.G(ctx).Infof("shim intent for %s withdrawn after failed create: no shim process was found", sandboxIdentity(sb))
+}
+
+// readBundleProcessIdentity is the pid read liveBundleHolder uses. It is a
+// variable so a test can report a pid as unreadable without a live /proc entry.
+var readBundleProcessIdentity = utils.ReadProcessIdentity
+
+// liveBundleHolder looks for a live process named by this sandbox's shim bundle
+// pid files. The shim writes those files about itself while it starts, so a
+// live pid there is real evidence that a spawn happened.
+func (l *local) liveBundleHolder(ctx context.Context, sb *cubeboxstore.CubeBox) (runtimePIDCandidate, bool) {
+	for _, bundle := range resolveShimBundles(l, ctx, sb) {
+		for _, name := range []string{shimPidFileName, vmmPidFileName} {
+			path := filepath.Join(bundle, name)
+			pid := readPidFile(path)
+			if pid <= 1 || pid == os.Getpid() {
+				continue
+			}
+			id, err := readBundleProcessIdentity(pid)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				// Unreadable is not proof of absence: keep the intent.
+				return runtimePIDCandidate{pid: pid, source: path}, true
+			}
+			if id.Status() == utils.LivenessAlive {
+				return runtimePIDCandidate{pid: pid, source: path}, true
+			}
+		}
+	}
+	return runtimePIDCandidate{}, false
 }
 
 func getMountOptions(mount *cubebox.VolumeMounts) []string {

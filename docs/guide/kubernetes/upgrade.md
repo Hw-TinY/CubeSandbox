@@ -70,10 +70,10 @@ Upgrade PVM kernel swap     →  only change images.pvmHostBootstrap.tag
 ```yaml
 images:
   cubelet:
-    tag: v0.7.2-rc3
+    tag: v0.7.3
   # Add others only if you need them together, e.g.:
   # cubeShim:
-  #   tag: v0.7.2-rc3
+  #   tag: v0.7.3
 ```
 
 Only change the keys you truly need to bump; leave other images alone. Full key names are in the [appendix](#appendix-image-key-cheat-sheet) at the end.
@@ -145,7 +145,7 @@ Any of the following **recreates** the Big Pod → the Pod UID changes; on the P
 | Manually delete the Big Pod | Equivalent to rebuilding the data plane |
 | Stuff artifact installs into the Big Pod | Breaks the split of duties; artifacts must go through Installer |
 
-Also: `cubeNode.env`, `cubeNode.podAnnotations`, network-related env, `global.timezone`, and `cubeEgress.enabled` also change the Pod template — **not silent day-to-day upgrade items**.
+Also: `cubeNode.env`, `cubeNode.podAnnotations`, network-related env, and `global.timezone` also change the Pod template — **not silent day-to-day upgrade items**.
 
 ---
 

@@ -38,6 +38,7 @@ pytest --run-e2e -m "lifecycle and slow"
 | `cases/lifecycle/test_negative_and_timeout.py` | Missing create/connect targets, pause-after-delete and online timeout update | `lifecycle`, `pause_resume`, `set_timeout` | P1 |
 | `cases/lifecycle/test_kill.py` | unusable after kill, list removal, idempotent terminal semantics | `lifecycle` | P1 |
 | `cases/lifecycle/test_auto_lifecycle.py` | auto-pause, manual/auto resume, reentrant resume, auto-kill, manual pause before timeout | `platform_lifecycle`, CubeProxy, lifecycle-manager, partially Code Interpreter | P1 + `slow`, daily run |
+| `cases/lifecycle/test_restart_policy.py` | policy on info, default Never, rejected values, healthy sandbox stays up, guest crash keeps id and durable file, kill does not restart, maxRestarts gives up, exit 0 only restarts Always, non-zero main-process exit, backoff schedule, stable-period reset, pause during backoff, pause and resume after a cold restart, delete during backoff, liveness failure | `restart_policy` (CubeSandbox only). Runs with `--run-e2e`. Cluster needs envd on port 49983. Pause cases also need `pause_resume` | P1 control plane; P2/P3 + `slow` for crash, exit, backoff and give-up |
 
 The current `platform_lifecycle` prerequisite reflects this branch's execution
 configuration: it depends on CubeProxy and lifecycle-manager coordination, but
@@ -77,7 +78,8 @@ data-plane regressions.
 - overwrite, multiline text and deep paths;
 - larger text content;
 - interoperability between file API and shell;
-- missing file error semantics.
+- missing file error semantics;
+- binary `bytes` and `stream` reads, including an empty file and a file created by the shell.
 
 `cases/filesystem/test_extended.py` covers directory and file metadata, nested
 and empty directory listing, exists, remove, rename and mkdir through the SDK
@@ -86,9 +88,8 @@ filesystem API.
 `cases/filesystem/test_batch_and_watch.py` covers multi-file writes and live
 directory create/write/remove events through both SDK backends.
 
-The current content coverage is text-file focused. Non-root permission
-behavior, binary round-trips, atomic replace and concurrent file access are not
-covered yet.
+Binary content is covered for `bytes` and `stream` reads. Non-root permission
+behavior, atomic replace and concurrent file access are not covered yet.
 
 ### 2.4 Run Code
 
@@ -168,6 +169,14 @@ It also builds a template with writable-layer size, exposed ports, HTTP probe
 and environment variables, then verifies those advanced parameters in the
 template detail returned by CubeAPI. Template operations are CubeSandbox-only.
 
+`cases/mcp/test_mcp_gateway.py` covers the E2B-compatible `mcp` create option on
+both backends: tool listing and calls through CubeProxy, `401` without a valid
+token, token recovery after `connect`, pause/resume, clone (CubeSandbox only),
+CubeAPI `400` for malformed `mcp`, and SDK failure on an unknown server. It needs
+a template built from `examples/mcp-gateway/template/Dockerfile`, selected with
+`SDK_E2E_MCP_TEMPLATE_ID` (default alias `mcp-gateway`). When that template does
+not exist, the module is skipped and the rest of the suite still runs.
+
 ### 2.7 Concurrency
 
 `cases/concurrency/test_isolation.py` currently validates file isolation between
@@ -207,11 +216,11 @@ UUID-named directories so parallel runs do not collide.
 The current suite mainly validates synchronous Python SDK paths and the
 CubeSandbox/E2B compatibility surface:
 
-- covered: create, info, command, text files, Python code, pause/resume, kill,
+- covered: create, info, command, text and binary file reads, Python code, pause/resume, kill,
   partial platform lifecycle, basic egress policy and two-sandbox file
   isolation;
 - not covered: async SDK, streaming output, complete template/snapshot/metadata
-  APIs, directory and binary filesystem operations, full HTTP/HTTPS/L7/UDP-DNS
+  APIs, non-root filesystem permissions, full HTTP/HTTPS/L7/UDP-DNS
   network semantics, cancellation/resource limits, real concurrency load and
   multi-node failure recovery.
 
@@ -236,7 +245,7 @@ contract maturity, environment reproducibility and CI budget.
 | --- | --- | --- | --- |
 | Lifecycle races | pause vs timeout, reentrant resume, kill vs resume | Expose state-machine and distributed lock issues | `cases/lifecycle/` |
 | Lifecycle timing | timeout refresh, manual pause before timeout, new idle cycle after manual connect, `endAt` drift | Validate lifecycle contract across time windows | `cases/lifecycle/` |
-| Filesystem | directories, non-root permissions, binary round-trip, empty files, delete/rename | Expand SDK file API compatibility | `cases/filesystem/` |
+| Filesystem | non-root permissions, atomic replace, concurrent file access | Expand SDK file API compatibility | `cases/filesystem/` |
 | Commands | working directory, user switching, signal/cancel, large output and resource cleanup after timeout | Catch process/stream cleanup bugs | `cases/commands/` |
 | Run code | kernel usability after errors, timeout, resource limit, rich output, language parameters | Validate interpreter resilience | `cases/run_code/` |
 | Network DNS/UDP | domain allow/deny, DNS failure, UDP DNS request/response | Avoid using TCP as a proxy for DNS/UDP policy | `cases/network/` |

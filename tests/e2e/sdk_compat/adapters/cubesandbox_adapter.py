@@ -35,6 +35,8 @@ class CubeSandboxAdapter(SandboxAdapter):
         if isinstance(extra_metadata, dict):
             merged_metadata.update(extra_metadata)
         timeout = opts.pop("timeout", config.create_timeout)
+        if config.cube_template_id:
+            opts.setdefault("template", config.cube_template_id)
         sandbox = None
         try:
             sandbox = Sandbox.create(
@@ -115,6 +117,15 @@ class CubeSandboxAdapter(SandboxAdapter):
 
     def read_file(self, path: str, *, user: str = "root") -> str:
         return self._sandbox.files.read(path, user=user)
+
+    def write_bytes(self, path: str, content: bytes, *, user: str = "root") -> None:
+        self._sandbox.files.write(path, content, user=user)
+
+    def read_bytes(self, path: str, *, user: str = "root") -> bytes:
+        return bytes(self._sandbox.files.read(path, format="bytes", user=user))
+
+    def read_stream(self, path: str, *, user: str = "root") -> bytes:
+        return b"".join(self._sandbox.files.read(path, format="stream", user=user))
 
     def list_files(self, path: str) -> list[dict[str, Any]]:
         return list(self._sandbox.files.list(path))
@@ -244,6 +255,24 @@ class CubeSandboxAdapter(SandboxAdapter):
             for sandbox in self._sandbox.clone(n=n, concurrency=concurrency)
         ]
 
+    def fork(
+        self, count: int = 1, *, timeout: int | None = None
+    ) -> list[tuple["CubeSandboxAdapter" | None, Exception | None]]:
+        results = self._sandbox.fork(count, timeout=timeout)
+        return [
+            (
+                type(self)(
+                    item,
+                    sdk_config=self._sdk_config,
+                    e2e_config=self._e2e_config,
+                ),
+                None,
+            )
+            if isinstance(item, self._sandbox.__class__)
+            else (None, item)
+            for item in results
+        ]
+
     def list_snapshot_ids(self) -> set[str]:
         from cubesandbox import Sandbox
 
@@ -268,6 +297,12 @@ class CubeSandboxAdapter(SandboxAdapter):
             if key in raw and raw[key]:
                 return str(raw[key])
         return None
+
+    def mcp_url(self) -> str:
+        return str(self._sandbox.get_mcp_url())
+
+    def mcp_token(self) -> str | None:
+        return self._sandbox.get_mcp_token()
 
     def update_network(self, network: dict | None = None) -> None:
         self._sandbox.update_network(network)

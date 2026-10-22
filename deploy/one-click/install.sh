@@ -1159,6 +1159,14 @@ check_install_preflight() {
   require_cmd grep
   require_cmd pgrep
   require_cmd date
+  # openssl is a hard dependency of cube-egress-prepare.sh, which generates
+  # the CubeEgress root CA (ECDSA P-256) at /etc/cube/ca/cube-root-ca.crt.
+  # cube-egress runs on both control and compute roles; on minimal/cloud
+  # images (e.g. OpenCloudOS 9 minimal) openssl may be absent, causing the
+  # service to restart-loop in ExecStartPre and create-from-image to fail
+  # when it bakes the CA. The /dev/urandom fallback used for the ops-store
+  # signing key below does NOT cover CA generation.
+  require_cmd openssl
 
   if needs_docker_for_install; then
     require_cmd docker
@@ -1573,6 +1581,20 @@ remove_obsolete_templatecenter_unit() {
   rm -f "/etc/systemd/system/cube-sandbox-compute.target.wants/${unit}"
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+}
+
+# Ship CubeShim/VMM host logrotate (#1290). Keep this unconditional: the
+# default one-click machine is a control+compute node, and
+# cube-sandbox-control.target also starts cubelet, so control-role nodes can
+# write these logs too. Soft-fail: never block the role target.
+install_cubeshim_logrotate() {
+  local install_script="${INSTALL_PREFIX}/scripts/logrotate/install-logrotate.sh"
+  if [[ ! -f "${install_script}" ]]; then
+    log "WARN: logrotate installer missing (${install_script}); skipping"
+    return 0
+  fi
+  bash "${install_script}" \
+    || log "WARN: cube-shim/vmm log rotation was not installed; continuing without it"
 }
 
 install_systemd_units() {
@@ -2180,12 +2202,18 @@ fi
 upsert_env_kv "${RUNTIME_ENV_FILE}" "RCOW_TGT_MEM_MB" "${RCOW_TGT_MEM_MB}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "RCOW_LISTEN_ADDR" "${RCOW_LISTEN_ADDR}"
 upsert_env_kv "${RUNTIME_ENV_FILE}" "RCOW_LISTEN_PORT" "${RCOW_LISTEN_PORT}"
+# The two hot-upgrade knobs. Their defaults live in rcow_common.sh; written out
+# so an operator can tune them through the usual .env mechanism instead of
+# editing the packaged scripts.
+upsert_env_kv "${RUNTIME_ENV_FILE}" "RCOW_HOT_FLUSH_MS" "${RCOW_HOT_FLUSH_MS:-0}"
+upsert_env_kv "${RUNTIME_ENV_FILE}" "RCOW_HOT_PREPARE_SUSPEND_MS" "${RCOW_HOT_PREPARE_SUSPEND_MS:-60000}"
 
 chmod +x "${INSTALL_PREFIX}/Cubelet/bin/"*
 chmod +x "${INSTALL_PREFIX}/cube-vs/network/bin/"* 2>/dev/null || true
 chmod +x "${INSTALL_PREFIX}/cube-shim/bin/containerd-shim-cube-rs" "${INSTALL_PREFIX}/cube-shim/bin/cube-runtime"
 chmod +x "${INSTALL_PREFIX}/scripts/one-click/"*.sh
 chmod +x "${INSTALL_PREFIX}/scripts/systemd/"*.sh
+chmod +x "${INSTALL_PREFIX}/scripts/logrotate/"*.sh 2>/dev/null || true
 chmod +x "${INSTALL_PREFIX}/scripts/cube-egress/"*.sh 2>/dev/null || true
 chmod +x "${INSTALL_PREFIX}/CubeS3lvol/scripts/"*.sh 2>/dev/null || true
 chmod +x "${INSTALL_PREFIX}/CubeS3lvol/bin/s3lvol_tgt" 2>/dev/null || true
@@ -2225,6 +2253,7 @@ restore_selinux_contexts
 # Persist the L7 skb->mark config before the units that consume it start.
 write_l7_marks_conf
 install_systemd_units
+install_cubeshim_logrotate
 mask_external_dep_services
 check_runtime_file_paths_not_directories
 start_systemd_target

@@ -64,13 +64,17 @@ def make_config(**kwargs) -> Config:
     return Config(**defaults)
 
 
-def mock_response(body=None, status: int = 200):
+def mock_response(body=None, status: int = 200, headers: dict | None = None):
     """Build a duck-typed requests.Response for control-plane SDK calls."""
     response = MagicMock()
     response.ok = 200 <= status < 400
     response.status_code = status
     response.text = json.dumps(body) if body is not None else ""
     response.json.return_value = body if body is not None else {}
+    # A real mapping, not a MagicMock: `headers.get("x-next-token", "")` has to
+    # be able to answer "absent", or any caller that follows a pagination
+    # cursor loops forever against a mock.
+    response.headers = headers if headers is not None else {}
     return response
 
 
@@ -315,6 +319,158 @@ class TestCreate:
             )
         body = m.call_args.kwargs["json"]
         assert body["lifecycle"] == {"autoResume": True}
+
+
+# ── MCP gateway (E2B-compatible ``mcp`` option) ───────────────────────────────
+
+class TestMcp:
+    MCP = {"duckduckgo": {}, "github/acme/tools": {"runCmd": "echo 'hi'", "envs": {"K": "v"}}}
+
+    def _create(self, run_result=None, **kwargs):
+        run_result = run_result or CommandResult(stdout="ready", stderr="", exit_code=0)
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as post, \
+                patch.object(Commands, "run", return_value=run_result) as run, \
+                patch.object(Sandbox, "kill") as kill:
+            sb = Sandbox.create(config=make_config(), **kwargs)
+        return sb, post.call_args.kwargs["json"], run, kill
+
+    def test_defaults_to_mcp_gateway_template(self):
+        _, body, _, _ = self._create(mcp=self.MCP)
+        assert body["templateID"] == "mcp-gateway"
+        assert body["mcp"] == self.MCP
+
+    def test_mcp_template_can_be_configured(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)) as post, \
+                patch.object(Commands, "run", return_value=CommandResult("", "", 0)):
+            Sandbox.create(mcp={}, config=make_config(mcp_template_id="tpl-mcp"))
+        assert post.call_args.kwargs["json"]["templateID"] == "tpl-mcp"
+
+    def test_explicit_template_wins(self):
+        _, body, _, _ = self._create(template="tpl-custom", mcp=self.MCP)
+        assert body["templateID"] == "tpl-custom"
+
+    def _create_with_responses(self, responses, **kwargs):
+        sent = []
+
+        def post(*_args, **kw):
+            sent.append(kw["json"]["templateID"])
+            return responses[len(sent) - 1]
+
+        with patch("requests.Session.post", side_effect=post), \
+                patch.object(Commands, "run", return_value=CommandResult("", "", 0)) as run, \
+                patch.object(Sandbox, "kill"):
+            try:
+                Sandbox.create(config=make_config(), **kwargs)
+            finally:
+                self.sent, self.run = sent, run
+
+    MISSING = {"code": 404, "message": "template mcp-gateway not found: template not found"}
+    LEGACY_MISSING = {"code": 500, "message": 'CubeMaster returned error code 130404: failed to resolve template identifier "mcp-gateway": template not found'}
+
+    @pytest.mark.parametrize("missing", [
+        mock_response(MISSING, status=404),
+        mock_response(LEGACY_MISSING, status=500),
+    ])
+    def test_falls_back_to_default_template_when_mcp_template_missing(self, missing):
+        self._create_with_responses([missing, mock_response(SANDBOX_DATA, status=201)], mcp=self.MCP)
+        assert self.sent == ["mcp-gateway", "tpl-test"]
+        self.run.assert_called_once()
+
+    def test_errors_when_no_candidate_template_exists(self):
+        missing = mock_response(self.MISSING, status=404)
+        with pytest.raises(TemplateNotFoundError, match="'mcp-gateway', 'tpl-test'.*mcp-gateway.md"):
+            self._create_with_responses([missing, missing], mcp=self.MCP)
+        assert self.sent == ["mcp-gateway", "tpl-test"]
+        self.run.assert_not_called()
+
+    def test_missing_explicit_template_does_not_fall_back(self):
+        with pytest.raises(TemplateNotFoundError):
+            self._create_with_responses([mock_response(self.MISSING, status=404)], template="tpl-x", mcp=self.MCP)
+        assert self.sent == ["tpl-x"]
+
+    def test_kwargs_template_id_is_sent_verbatim(self):
+        self._create_with_responses([mock_response(SANDBOX_DATA, status=201)], templateID="tpl-x")
+        assert self.sent == ["tpl-x"]
+        with pytest.raises(TemplateNotFoundError):
+            self._create_with_responses([mock_response(self.MISSING, status=404)], templateID="tpl-x", mcp=self.MCP)
+        assert self.sent == ["tpl-x"]
+        self.run.assert_not_called()
+
+    def test_other_errors_do_not_fall_back(self):
+        with pytest.raises(ApiError):
+            self._create_with_responses([mock_response({"message": "boom"}, status=500)], mcp=self.MCP)
+        assert self.sent == ["mcp-gateway"]
+
+    def test_missing_gateway_binary_names_template(self):
+        missing = CommandResult(stdout="", stderr="/bin/bash: mcp-gateway: command not found", exit_code=127)
+        with pytest.raises(CubeSandboxError, match="template 'tpl-test' does not provide mcp-gateway"):
+            self._create(run_result=missing, mcp=self.MCP)
+
+    def test_without_mcp_does_not_start_gateway(self):
+        _, body, run, _ = self._create()
+        assert body["templateID"] == "tpl-test"
+        assert "mcp" not in body
+        run.assert_not_called()
+
+    def test_starts_gateway_with_token(self):
+        sb, _, run, kill = self._create(mcp=self.MCP)
+        cmd = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        assert cmd.startswith("mcp-gateway --config ")
+        import shlex
+        assert shlex.split(cmd)[:2] == ["mcp-gateway", "--config"]
+        assert len(shlex.split(cmd)) == 3
+        assert json.loads(shlex.split(cmd)[2]) == self.MCP
+        assert kwargs["user"] == "root"
+        token = kwargs["envs"]["GATEWAY_ACCESS_TOKEN"]
+        assert token and sb.get_mcp_token() == token
+        assert kwargs["timeout"] == 60
+        kill.assert_not_called()
+
+    def test_empty_mcp_still_starts_gateway(self):
+        _, body, run, _ = self._create(mcp={})
+        assert body["mcp"] == {}
+        run.assert_called_once()
+
+    def test_gateway_failure_kills_sandbox(self):
+        failed = CommandResult(stdout="", stderr='mcp server "duckduckgo": boom', exit_code=1)
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)), \
+                patch.object(Commands, "run", return_value=failed), \
+                patch.object(Sandbox, "kill") as kill:
+            with pytest.raises(CubeSandboxError, match="Failed to start MCP gateway: .*boom"):
+                Sandbox.create(mcp=self.MCP, config=make_config())
+        kill.assert_called_once()
+
+    def test_gateway_exception_kills_sandbox(self):
+        with patch("requests.Session.post", return_value=mock_response(SANDBOX_DATA, status=201)), \
+                patch.object(Commands, "run", side_effect=TimeoutError("slow")), \
+                patch.object(Sandbox, "kill", side_effect=ApiError("gone", 500)) as kill:
+            with pytest.raises(TimeoutError):
+                Sandbox.create(mcp=self.MCP, config=make_config())
+        kill.assert_called_once()
+
+    def test_invalid_mcp_rejected_by_api(self):
+        err = mock_response({"code": 400, "message": "mcp must be an object keyed by MCP server name"}, status=400)
+        with patch("requests.Session.post", return_value=err), patch.object(Commands, "run") as run:
+            with pytest.raises(ApiError, match="keyed by MCP server name"):
+                Sandbox.create(mcp=["duckduckgo"], config=make_config())
+        run.assert_not_called()
+
+    def test_get_mcp_url(self):
+        assert make_sandbox().get_mcp_url() == f"http://50005-{SANDBOX_ID}.{DOMAIN}/mcp"
+
+    def test_get_mcp_token_reads_token_file(self):
+        sb = make_sandbox()
+        with patch.object(Filesystem, "exists", return_value=True) as exists, \
+                patch.object(Filesystem, "read", return_value="tok\n") as read:
+            assert sb.get_mcp_token() == "tok"
+            assert sb.get_mcp_token() == "tok"
+        exists.assert_called_once_with("/etc/mcp-gateway/.token", user="root")
+        read.assert_called_once_with("/etc/mcp-gateway/.token", user="root")
+
+    def test_get_mcp_token_none_without_gateway(self):
+        with patch.object(Filesystem, "exists", return_value=False):
+            assert make_sandbox().get_mcp_token() is None
 
 
 # ── domain filtering (DNS allow-list) ────────────────────────────────────────
@@ -924,6 +1080,20 @@ class TestGetInfo:
         assert result.state == SandboxState.PAUSED
         assert result.state == "paused"
         assert str(result.state) == "paused"
+
+    def test_get_info_state_covers_every_documented_state(self):
+        """Every state CubeAPI documents resolves to a member, not a raw str."""
+        sb = make_sandbox()
+        for state in ("running", "paused", "pausing", "unknown"):
+            info = {**FULL_INFO_DATA, "state": state}
+            with patch.object(sb._session, "get", return_value=mock_response(info)):
+                result = sb.get_info()
+            assert result.state is SandboxState(state), state
+            assert result.state == state
+
+    def test_sandbox_state_lookup_is_case_insensitive(self):
+        assert SandboxState("PAUSING") is SandboxState.PAUSING
+        assert SandboxState("Unknown") is SandboxState.UNKNOWN
 
     def test_get_info_unknown_state_falls_back_to_string(self):
         sb = make_sandbox()
@@ -1664,6 +1834,44 @@ class TestFilesystem:
         with patch.object(sb, "_build_data_client", return_value=client):
             with pytest.raises(IOError, match="Failed to read"):
                 sb.files.read("/tmp/missing.txt")
+
+    def test_read_bytes_preserves_binary(self):
+        # PNG magic: format="bytes" keeps 0x89; text would turn it into U+FFFD.
+        png = bytes([0x89, 0x50, 0x4E, 0x47])
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=png)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            got = sb.files.read("/tmp/x.png", format="bytes")
+        assert isinstance(got, bytearray)
+        assert bytes(got) == png
+
+    def test_read_stream_yields_bytes(self):
+        png = bytes([0x89, 0x50, 0x4E, 0x47])
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=png)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            chunks = list(sb.files.read("/tmp/x.png", format="stream"))
+        assert b"".join(chunks) == png
+
+    def test_read_empty_content_length_zero(self):
+        sb = make_sandbox()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"", headers={"content-length": "0"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(sb, "_build_data_client", return_value=client):
+            assert sb.files.read("/tmp/empty", format="text") == ""
+            assert sb.files.read("/tmp/empty", format="bytes") == bytearray()
+            assert list(sb.files.read("/tmp/empty", format="stream")) == []
 
     def test_write_uses_envd_file_api(self):
         sb = make_sandbox()
@@ -2588,6 +2796,166 @@ class TestClone:
                 sb.clone(n=1, snapshot_name="leaky")  # type: ignore[call-arg]
 
 
+class TestFork:
+    """Tests for ``Sandbox.fork(count, *, timeout)`` — server-side E2B fork:
+    one ``POST /sandboxes/{id}/fork`` round-trip returning an array of
+    ``{sandbox}|{error}``; per-fork independent success/failure, never
+    all-or-nothing."""
+
+    @staticmethod
+    def _fork_body(sb, count, timeout=None):
+        """Return a 201-style body with ``count`` all-successful fork entries."""
+        return [
+            {
+                "sandbox": {
+                    **SANDBOX_DATA,
+                    "sandboxID": f"sb-fork-{i:03d}",
+                    "clientID": "req-fork",
+                    "envdVersion": "2.3.4",
+                    "trafficAccessToken": None,
+                }
+            }
+            for i in range(count)
+        ]
+
+    @staticmethod
+    def _fork_error(code=130409, message="derivation rejected"):
+        return {"error": {"code": code, "message": message}}
+
+    def _make_ok_sandbox(self):
+        # A real instance whose `_session.post` we patch; nothing hits the network.
+        return make_sandbox()
+
+    def test_fork_default_returns_one(self):
+        sb = self._make_ok_sandbox()
+        body = self._fork_body(sb, 1)
+        with patch.object(sb._session, "post", return_value=mock_response(body)) as post:
+            result = sb.fork()
+        assert len(result) == 1
+        assert isinstance(result[0], Sandbox)
+        assert result[0].sandbox_id == "sb-fork-000"
+        post.assert_called_once_with(
+            f"http://localhost:3000/sandboxes/{sb.sandbox_id}/fork",
+            json={"count": 1},
+            timeout=1600.0,
+        )
+
+    def test_fork_count_sequential(self):
+        sb = self._make_ok_sandbox()
+        body = self._fork_body(sb, 5)
+        with patch.object(sb._session, "post", return_value=mock_response(body)) as post:
+            result = sb.fork(count=5)
+        assert len(result) == 5
+        assert all(isinstance(r, Sandbox) for r in result)
+        post.assert_called_once_with(
+            f"http://localhost:3000/sandboxes/{sb.sandbox_id}/fork",
+            json={"count": 5},
+            timeout=1600.0,
+        )
+
+    def test_fork_passes_timeout_in_payload(self):
+        sb = self._make_ok_sandbox()
+        body = self._fork_body(sb, 2)
+        with patch.object(sb._session, "post", return_value=mock_response(body)) as post:
+            sb.fork(count=2, timeout=60)
+        post.assert_called_once_with(
+            f"http://localhost:3000/sandboxes/{sb.sandbox_id}/fork",
+            json={"count": 2, "timeout": 60},
+            timeout=1600.0,
+        )
+
+    def test_fork_timeout_none_omits_timeout(self):
+        sb = self._make_ok_sandbox()
+        body = self._fork_body(sb, 2)
+        with patch.object(sb._session, "post", return_value=mock_response(body)) as post:
+            sb.fork(count=2)
+        post.assert_called_once_with(
+            f"http://localhost:3000/sandboxes/{sb.sandbox_id}/fork",
+            json={"count": 2},
+            timeout=1600.0,
+        )
+
+    def test_fork_rejects_count_out_of_range(self):
+        sb = self._make_ok_sandbox()
+        for bad in (0, -1, 101):
+            with pytest.raises(ValueError, match="count must be between 1 and 100"):
+                sb.fork(count=bad)
+
+    def test_fork_rejects_result_count_mismatch(self):
+        """A response array shorter/longer than count is a contract violation."""
+        sb = self._make_ok_sandbox()
+        for body in ([self._fork_body(sb, 1)], [self._fork_body(sb, 4)]):
+            with patch.object(sb._session, "post", return_value=mock_response(body)):
+                with pytest.raises(ApiError, match="expected 3"):
+                    sb.fork(count=3)
+
+    def test_fork_partial_failure_keeps_successes(self):
+        """Server returns a mix of sandbox + error entries: successes are kept
+        (never killed) and failures surface as exception entries at their slot."""
+        sb = self._make_ok_sandbox()
+        body = [
+            {"sandbox": {**SANDBOX_DATA, "sandboxID": "sb-fork-000"}},
+            self._fork_error(),
+            {"sandbox": {**SANDBOX_DATA, "sandboxID": "sb-fork-002"}},
+            {"sandbox": {**SANDBOX_DATA, "sandboxID": "sb-fork-003"}},
+            self._fork_error(),
+        ]
+        with patch.object(sb._session, "post", return_value=mock_response(body)) as post:
+            with patch.object(Sandbox, "kill") as kill_p:
+                result = sb.fork(count=5)
+        assert len(result) == 5, "fork must report one outcome per requested slot"
+        ok = [r for r in result if isinstance(r, Sandbox)]
+        errs = [r for r in result if isinstance(r, BaseException)]
+        assert len(ok) == 3
+        assert len(errs) == 2
+        assert [r.sandbox_id for r in ok] == ["sb-fork-000", "sb-fork-002", "sb-fork-003"]
+        assert all(isinstance(e, ApiError) for e in errs)
+        assert "derivation rejected" in str(errs[0])
+        # Per-fork business code goes to ret_code, not status_code.
+        assert errs[0].ret_code == 130409
+        assert errs[0].status_code is None
+        # Successes are preserved and NOT killed by fork itself.
+        kill_p.assert_not_called()
+        post.assert_called_once()
+
+    def test_fork_all_fail_returns_exceptions(self):
+        """Every entry is an error: fork returns all Exception entries."""
+        sb = self._make_ok_sandbox()
+        body = [self._fork_error(code=130409, message="boom") for _ in range(3)]
+        with patch.object(sb._session, "post", return_value=mock_response(body)):
+            result = sb.fork(count=3)
+        assert len(result) == 3
+        assert all(isinstance(r, BaseException) for r in result)
+        assert all("boom" in str(r) for r in result)
+
+    def test_fork_defaults_to_long_request_timeout(self):
+        """fork carries its own request budget; requests' default is no timeout."""
+        sb = self._make_ok_sandbox()
+        with patch.object(sb._session, "post", return_value=mock_response(self._fork_body(sb, 1))) as post:
+            sb.fork()
+        assert post.call_args.kwargs["timeout"] == 1600.0
+
+    def test_fork_request_timeout_override(self):
+        sb = self._make_ok_sandbox()
+        with patch.object(sb._session, "post", return_value=mock_response(self._fork_body(sb, 1))) as post:
+            sb.fork(request_timeout=30)
+        assert post.call_args.kwargs["timeout"] == 30
+
+    def test_fork_request_failure_raises(self):
+        """A whole-request failure (HTTP error, e.g. sandbox not found) is raised;
+        no fork was attempted."""
+        sb = self._make_ok_sandbox()
+        with patch.object(
+            sb._session,
+            "post",
+            return_value=mock_response(
+                {"code": 404, "message": "sandbox not found"}, status=404
+            ),
+        ):
+            with pytest.raises(SandboxNotFoundError):
+                sb.fork(count=3)
+
+
 # ── Templates ─────────────────────────────────────────────────────────────────
 
 class TestTemplateAPI:
@@ -2848,3 +3216,59 @@ class TestExports:
     def test_command_result_in_all(self):
         import cubesandbox
         assert "CommandResult" in cubesandbox.__all__
+
+
+# ── list_v2 pagination ────────────────────────────────────────────────────────
+
+class TestListV2Pagination:
+    """`list_v2` promises *all* sandboxes, so it must follow the cursor.
+
+    `GET /v2/sandboxes` answers at most `limit` (100 by default) per page and
+    hands the next position back in `x-next-token`. Dropping that header — which
+    is what the method used to do — silently truncates the list for any caller
+    with more sandboxes than one page, while the docstring still says "all".
+    """
+
+    @staticmethod
+    def _page(items, next_token=None):
+        headers = {} if next_token is None else {"x-next-token": next_token}
+        return mock_response(items, headers=headers)
+
+    def test_follows_the_cursor_until_it_is_exhausted(self):
+        # 250 sandboxes over a 100-per-page endpoint: three pages.
+        first = [{"sandboxID": f"sb-{i:03d}"} for i in range(100)]
+        second = [{"sandboxID": f"sb-{i:03d}"} for i in range(100, 200)]
+        third = [{"sandboxID": f"sb-{i:03d}"} for i in range(200, 250)]
+
+        with patch("requests.Session.get") as get_call:
+            get_call.side_effect = [
+                self._page(first, next_token="c100"),
+                self._page(second, next_token="c200"),
+                # No header on the last page: that is the end of the list.
+                self._page(third),
+            ]
+            result = Sandbox.list_v2(config=make_config())
+
+        assert len(result) == 250, (
+            "list_v2 must follow x-next-token, not return only the first page"
+        )
+        assert [item["sandboxID"] for item in result] == [
+            f"sb-{i:03d}" for i in range(250)
+        ]
+        # The cursor is sent back as the query parameter the endpoint declares.
+        # `requests` receives it as `params=`, so assert on the kwargs.
+        sent = [call.kwargs.get("params") for call in get_call.call_args_list]
+        assert get_call.call_args_list[0].args[0].endswith("/v2/sandboxes")
+        assert not sent[0], "page one must not carry a cursor"
+        assert sent[1] == {"nextToken": "c100"}
+        assert sent[2] == {"nextToken": "c200"}
+
+    def test_single_page_is_returned_unchanged(self):
+        only = [{"sandboxID": "sb-1"}, {"sandboxID": "sb-2"}]
+
+        with patch("requests.Session.get") as get_call:
+            get_call.return_value = self._page(only)
+            result = Sandbox.list_v2(config=make_config())
+
+        assert result == only
+        assert get_call.call_count == 1, "a cursor-less page must not trigger a refetch"

@@ -6,7 +6,7 @@
   <a href="https://github.com/TencentCloud/CubeSandbox"><img src="https://img.shields.io/badge/CubeSandbox-GitHub-blue" alt="CubeSandbox" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green" alt="Apache 2.0" /></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-blue" alt="Python 3.9+" />
-  <img src="https://img.shields.io/badge/version-0.6.0-orange" alt="v0.6.0" />
+  <img src="https://img.shields.io/badge/version-0.7.3-orange" alt="v0.7.3" />
 </p>
 
 ---
@@ -104,6 +104,25 @@ sb.pause(timeout=60, interval=0.5) # 自定义轮询参数
 # 通过连接恢复 —— 自动恢复已暂停的沙箱
 sb2 = Sandbox.connect(sb.sandbox_id)
 ```
+
+### 分叉（Fork）
+
+```python
+sb = Sandbox.create()
+
+# 一次服务端调用：后端对 sb 只打一次快照，派生 N 个副本。
+forks = sb.fork(count=3)              # list[Sandbox | Exception]，每个 fork 一项
+forks = sb.fork(count=3, timeout=60)  # timeout：新副本空闲存活时长，单位秒
+
+for f in forks:
+    if isinstance(f, Sandbox):
+        f.run_code("print('alive')")  # 运行中的副本
+    else:
+        print(f)                      # 该 fork 的异常
+```
+
+部分成功会保留副本且不抛异常；只有整体失败才抛异常（如源沙箱不存在）。
+`count` 为 1..100（默认 1）。与 `clone` 不同，临时快照由服务端管理。
 
 ### 指定计算节点
 

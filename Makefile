@@ -173,6 +173,7 @@ help:
 	@printf "  cubelog-test  Run cubelog unit tests on the host\n"
 	@printf "  cubedb-test   Run CubeDB unit tests on the host\n"
 	@printf "  blobstore-test Run pkgs/blobstore unit tests on the host\n"
+	@printf "  sandboxrestart-test Run pkgs/sandboxrestart unit tests on the host\n"
 	@printf "  proto-test    Run pkgs/proto unit tests on the host\n"
 	@printf "  cube-lifecycle-manager-test Run cube-lifecycle-manager unit tests in Docker\n"
 	@printf "  agent-test    Run cube-agent unit tests in Docker\n"
@@ -488,7 +489,7 @@ cubemaster-test: builder-image
 # through the builder like every other Go component.
 .PHONY: cubetemplatecenter-test
 cubetemplatecenter-test: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeTemplateCenter && go mod download && go test ./... -count=1'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeTemplateCenter && go mod download && CUBEMASTER_REQUIRE_EXT4_TESTS=1 go test ./... -count=1'
 
 # cubecow-sdk (CGO) and cubevs's generated BPF code are build prerequisites
 # for several Cubelet packages.
@@ -536,6 +537,11 @@ cubedb-test:
 blobstore-test:
 	cd pkgs/blobstore && go mod download && go test ./...
 
+# pkgs/sandboxrestart is stdlib-only, so no module download is needed.
+.PHONY: sandboxrestart-test
+sandboxrestart-test:
+	cd pkgs/sandboxrestart && go test ./...
+
 # pkgs/proto runs on the host: pure Go (generated .pb.go + grpc/protobuf
 # deps, no CGO/builder-only deps), like cubelog/cubedb. Consumers only
 # compile its non-test code via replace, so the module's own _test.go files
@@ -571,12 +577,12 @@ agent-test: builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace/agent && make test'
 
 # Only unit tests (--lib --bins) run here; the tests/integration.rs target
-# needs a full VM. This does not pass /dev/kvm into the builder, so the
-# runtime-KVM vmm tests are not reached (see tests/unittest/run.sh
-# hypervisor-kvm for those).
+# needs a full VM. The root package command does not execute workspace member
+# tests, so block_util runs explicitly. This does not pass /dev/kvm into the
+# builder; see tests/unittest/run.sh hypervisor-kvm for runtime-KVM tests.
 .PHONY: hypervisor-test
 hypervisor-test: builder-image
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace/hypervisor && cargo test --features kvm --lib --bins'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/hypervisor && cargo test --features kvm --lib --bins && cargo test -p block_util --lib'
 
 .PHONY: shim
 shim: builder-image
@@ -668,6 +674,8 @@ ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
 	@$(MAKE) -C pkgs/proto fmt
 	@printf '  %-8s %s\n' "FMT" "blobstore"
 	@$(MAKE) -C pkgs/blobstore fmt
+	@printf '  %-8s %s\n' "FMT" "sandboxrestart"
+	@$(MAKE) -C pkgs/sandboxrestart fmt
 	@printf '  %-8s %s\n' "FMT" "CubeMaster"
 	@$(MAKE) -C CubeMaster fmt
 	@printf '  %-8s %s\n' "FMT" "CubeTemplateCenter"

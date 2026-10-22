@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 import threading
+import uuid
 from typing import Any, Callable, Dict
 
 import httpx
@@ -25,6 +28,13 @@ from ._transport import build_client
 from ._volume import VolumeMountsArg, _serialize_volume_mounts
 
 JUPYTER_PORT = 49999
+
+#: Port the in-sandbox ``mcp-gateway`` listens on (E2B-compatible).
+MCP_PORT = 50005
+MCP_TOKEN_PATH = "/etc/mcp-gateway/.token"
+#: How long ``mcp-gateway --config`` may take, matching the E2B SDK's default
+#: command timeout. Pre-install servers in the template to stay within it.
+MCP_STARTUP_TIMEOUT = 60
 
 #: Never-timeout sentinel. See docs/guide/lifecycle.md.
 NEVER_TIMEOUT = -1
@@ -82,7 +92,16 @@ def _check_response(resp: requests.Response) -> None:
     raise ApiError(msg, code)
 
 
+def _is_template_not_found(resp: requests.Response) -> bool:
+    # Older CubeAPI builds relay CubeMaster's 130404 without mapping it to 404.
+    text = resp.text.lower()
+    return (resp.status_code == 404 and "template" in text) or "130404" in text
+
+
 _VALID_ON_TIMEOUT = ("kill", "pause")
+
+# Fork request budget: CubeAPI's FORK_ROUTE_TIMEOUT (1560 s) plus headroom.
+FORK_REQUEST_TIMEOUT_S = 1600.0
 
 
 def _serialize_lifecycle(lifecycle: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,6 +146,7 @@ class Sandbox:
         self._files = Filesystem(self)
         self._pty = Pty(self)
         self._clone_cleanup: _CloneCleanup | None = None
+        self._mcp_token: str | None = None
 
 
     @property
@@ -167,6 +187,41 @@ class Sandbox:
         """
         return f"{port}-{self.sandbox_id}.{self.domain}"
 
+    def get_mcp_url(self) -> str:
+        """Return the streamable-HTTP URL of the sandbox MCP gateway.
+
+        Send ``Authorization: Bearer <get_mcp_token()>`` with every request.
+        """
+        return f"http://{self.get_host(MCP_PORT)}/mcp"
+
+    def get_mcp_token(self) -> str | None:
+        """Return the MCP gateway bearer token, or ``None`` if MCP is not enabled.
+
+        The token is cached on the instance that started the gateway; other
+        instances (e.g. from :meth:`connect`) read it from the sandbox.
+        """
+        if self._mcp_token is None and self.files.exists(MCP_TOKEN_PATH, user="root"):
+            self._mcp_token = self.files.read(MCP_TOKEN_PATH, user="root").strip()
+        return self._mcp_token
+
+    def _start_mcp_gateway(self, mcp: Dict[str, Any]) -> None:
+        token = str(uuid.uuid4())
+        result = self.commands.run(
+            f"mcp-gateway --config {shlex.quote(json.dumps(mcp))}",
+            user="root",
+            envs={"GATEWAY_ACCESS_TOKEN": token},
+            timeout=MCP_STARTUP_TIMEOUT,
+        )
+        if result.exit_code != 0:
+            detail = (result.stderr or result.stdout).strip()
+            if result.exit_code == 127:
+                detail = (
+                    f"template {self.template_id!r} does not provide mcp-gateway "
+                    f"(see docs/guide/mcp-gateway.md): {detail}"
+                )
+            raise CubeSandboxError(f"Failed to start MCP gateway: {detail}")
+        self._mcp_token = token
+
     @property
     def commands(self) -> "Commands":
         return self._commands
@@ -194,13 +249,17 @@ class Sandbox:
         network: Dict[str, Any] | None = None,
         lifecycle: Dict[str, Any] | None = None,
         volume_mounts: VolumeMountsArg | None = None,
+        mcp: Dict[str, Any] | None = None,
         config: Config | None = None,
         **kwargs: Any,
     ) -> "Sandbox":
         """POST /sandboxes - Create a new sandbox.
 
         Args:
-            template: Template ID. Falls back to ``CUBE_TEMPLATE_ID`` env var.
+            template: Template ID or alias. Falls back to ``CUBE_TEMPLATE_ID``.
+                When ``mcp`` is set, ``Config.mcp_template_id`` (``mcp-gateway``
+                by default) is tried first and ``CUBE_TEMPLATE_ID`` is used only
+                if that template does not exist.
             timeout: Sandbox idle timeout in seconds (``None`` omits the field).
                 See ``docs/guide/lifecycle.md``.
             env_vars: Environment variables injected into the sandbox.
@@ -254,6 +313,13 @@ class Sandbox:
                 :meth:`cubesandbox.Volume.create`. ``read_only`` applies to this
                 sandbox attachment; it does not make the volume an immutable
                 snapshot.
+            mcp: E2B-compatible MCP servers keyed by server name, e.g.
+                ``{"duckduckgo": {}, "arxiv": {"storagePath": "/"}}`` or
+                ``{"github/<owner>/<repo>": {"runCmd": ..., "installCmd": ...,
+                "envs": {...}}}``. When set, ``mcp-gateway`` is started inside
+                the sandbox after creation; use :meth:`get_mcp_url` and
+                :meth:`get_mcp_token` to connect. The template must ship the
+                ``mcp-gateway`` binary.
             config: SDK config. Uses default (env-based) config if omitted.
 
         Returns:
@@ -262,11 +328,24 @@ class Sandbox:
         Raises:
             ValueError: If no template ID is provided, or if ``lifecycle``
                 contains an unsupported ``on_timeout`` value.
-            ApiError: On unexpected backend error (HTTP 500).
+            ApiError: On unexpected backend error (HTTP 500), or HTTP 400 for
+                an invalid ``mcp`` shape.
+            TemplateNotFoundError: If ``mcp`` is set without ``template`` and
+                none of the candidate templates exists.
+            CubeSandboxError: If the MCP gateway fails to start. The sandbox
+                is killed before the error is raised.
         """
         cfg = config or Config()
-        tpl = template or cfg.template_id
-        if not tpl:
+        # A templateID in kwargs is an explicit choice: it is sent verbatim,
+        # without the MCP template fallback.
+        fallback = not template and mcp is not None and "templateID" not in kwargs
+        if template:
+            templates = [template]
+        elif fallback:
+            templates = list(dict.fromkeys(t for t in (cfg.mcp_template_id, cfg.template_id) if t))
+        else:
+            templates = [cfg.template_id] if cfg.template_id else []
+        if not templates:
             raise ValueError("template is required. Set CUBE_TEMPLATE_ID or pass template=")
 
         if env_vars is not None and envs is not None and env_vars != envs:
@@ -274,7 +353,7 @@ class Sandbox:
         sandbox_env_vars = env_vars if env_vars is not None else envs
 
         # Omitted when None; see docs/guide/lifecycle.md.
-        payload: dict = {"templateID": tpl}
+        payload: dict = {"templateID": templates[0]}
         if timeout is not None:
             payload["timeout"] = timeout
         if sandbox_env_vars:
@@ -296,13 +375,33 @@ class Sandbox:
             payload["lifecycle"] = _serialize_lifecycle(lifecycle)
         if volume_mounts:
             payload["volumeMounts"] = _serialize_volume_mounts(volume_mounts)
-        payload.update(kwargs)
-
+        if mcp is not None:
+            payload["mcp"] = mcp
         s = requests.Session()
-        resp = s.post(f"{cfg.api_url}/sandboxes", json=payload,
-                      headers={"Content-Type": "application/json", **_auth_headers(cfg)})
+        for tpl in templates:
+            resp = s.post(f"{cfg.api_url}/sandboxes", json={**payload, "templateID": tpl, **kwargs},
+                          headers={"Content-Type": "application/json", **_auth_headers(cfg)})
+            if not (fallback and _is_template_not_found(resp)):
+                break
+        else:
+            raise TemplateNotFoundError(
+                f"no template for mcp: tried {', '.join(repr(t) for t in templates)}. "
+                "Build a template that provides mcp-gateway (see docs/guide/mcp-gateway.md), "
+                "then pass template= or set CUBE_MCP_TEMPLATE_ID",
+                resp.status_code,
+            )
         _check_response(resp)
-        return cls(resp.json(), config=cfg)
+        sandbox = cls(resp.json(), config=cfg)
+        if mcp is not None:
+            try:
+                sandbox._start_mcp_gateway(mcp)
+            except BaseException:
+                try:
+                    sandbox.kill()
+                except Exception:  # noqa: BLE001 — surface the gateway error
+                    pass
+                raise
+        return sandbox
 
     @classmethod
     def connect(
@@ -332,7 +431,9 @@ class Sandbox:
             SandboxNotFoundError: If the sandbox does not exist (HTTP 404).
             ApiError: If the timeout is ``0`` or below ``-1`` (HTTP 400), an
                 overlapping lifecycle transition prevents the connection
-                (HTTP 409), or an unexpected backend error occurs.
+                (HTTP 409), the sandbox's container has already exited
+                (HTTP 409, permanent — do not retry), or an unexpected backend
+                error occurs.
         """
         cfg = config or Config()
         s = requests.Session()
@@ -369,6 +470,12 @@ class Sandbox:
 
         Supports state / metadata filtering on the server side.
 
+        The endpoint answers one page at a time (``limit``, 100 by default) and
+        reports the next page's position in the ``x-next-token`` response
+        header. This method follows that cursor until it is absent, so the
+        returned list is every matching sandbox rather than only the first
+        page.
+
         Args:
             config: SDK config. Uses default (env-based) config if omitted.
 
@@ -377,9 +484,23 @@ class Sandbox:
         """
         cfg = config or Config()
         s = requests.Session()
-        resp = s.get(f"{cfg.api_url}/v2/sandboxes", headers=_auth_headers(cfg))
-        _check_response(resp)
-        return resp.json()
+        collected: list[dict] = []
+        # `nextToken` is the query parameter the endpoint declares; the empty
+        # first request is what fetches page one.
+        params: dict[str, str] = {}
+        while True:
+            resp = s.get(
+                f"{cfg.api_url}/v2/sandboxes",
+                headers=_auth_headers(cfg),
+                params=params,
+            )
+            _check_response(resp)
+            collected.extend(resp.json())
+            # Absent (or blank) header means the last page has been returned.
+            next_token = resp.headers.get("x-next-token", "")
+            if not next_token:
+                return collected
+            params = {"nextToken": next_token}
 
     @classmethod
     def health(cls, config: Config | None = None) -> dict:
@@ -864,6 +985,7 @@ class Sandbox:
                             first_error = exc
                         # Keep draining: another in-flight create may
                         # still succeed and we must not drop its result.
+
         cleanup = _CloneCleanup(snap_id, len(sandboxes), cfg)
         for sb in sandboxes:
             sb._clone_cleanup = cleanup
@@ -889,6 +1011,73 @@ class Sandbox:
             except Exception:  # noqa: BLE001 — best-effort cleanup
                 pass
         return sandboxes
+
+    def fork(
+        self,
+        count: int = 1,
+        *,
+        timeout: int | None = None,
+        request_timeout: float | None = None,
+    ) -> list["Sandbox" | BaseException]:
+        """Fork this sandbox *count* times (server-side).
+
+        Delegates the fork to the backend: ``POST /sandboxes/{id}/fork`` asks
+        CubeMaster to snapshot this sandbox once and derive ``count`` copies in
+        a single round-trip. Each fork succeeds or fails independently: the
+        returned list has one entry per requested fork — a :class:`Sandbox`, or
+        the ``BaseException`` that prevented it from starting. Successful forks
+        are kept even when siblings fail (unlike :meth:`clone`, which is
+        all-or-nothing). The temporary snapshot is managed by the server, so no
+        client-side cleanup is needed. Fork concurrency is bounded server-side.
+
+        Args:
+            count: Number of forks to create, 1..100 (default: 1).
+            timeout: Idle timeout in seconds per new fork (``None`` = server
+                default); only affects the forks.
+            request_timeout: Client-side request budget in seconds (default
+                1600, sized to the server's fork budget).
+
+        Returns:
+            A list with exactly *count* entries, in request order.
+
+        Raises:
+            ValueError: If ``count`` is outside ``1..100``.
+            ApiError: If the whole fork request fails before any fork was
+                attempted (e.g. sandbox not found). Per-fork failures are not
+                raised — they appear as exception entries in the result list.
+        """
+        if count < 1 or count > 100:
+            raise ValueError("count must be between 1 and 100")
+
+        payload: dict[str, Any] = {"count": count}
+        if timeout is not None:
+            payload["timeout"] = timeout
+
+        resp = self._session.post(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/fork",
+            json=payload,
+            timeout=request_timeout if request_timeout is not None else FORK_REQUEST_TIMEOUT_S,
+        )
+        _check_response(resp)
+
+        # Body is an array with one entry per fork: {sandbox}|{error}.
+        entries = resp.json() or []
+        if len(entries) != count:
+            raise ApiError(f"fork returned {len(entries)} results, expected {count}")
+
+        out: list["Sandbox" | BaseException] = []
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("sandbox"):
+                out.append(Sandbox(entry["sandbox"], config=self._config))
+            else:
+                err = entry.get("error", {}) if isinstance(entry, dict) else {}
+                out.append(
+                    ApiError(
+                        err.get("message", "fork failed"),
+                        ret_code=err.get("code"),
+                    )
+                )
+        return out
 
 
     def _build_session(self) -> requests.Session:

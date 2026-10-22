@@ -23,6 +23,8 @@ cubeProxy:
   domain: "cube.app"
   tls:
     mode: selfSigned   # trial; production: existingSecret or certManager
+    # selfSigned:
+    #   rotateOnSanChange: true   # re-issue cert (and CA) when domain/dnsNames change
   # TKE only (when using values-tke.yaml LoadBalancer):
   # service:
   #   annotations:
@@ -140,5 +142,5 @@ redis:
 # images:
 #   ops:
 #     repository: my-mirror.example.com/cube-sandbox/cube-ops
-#     tag: v0.7.2-rc3
+#     tag: v0.7.3
 #     pullPolicy: Always
